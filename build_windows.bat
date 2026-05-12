@@ -5,11 +5,17 @@ title Video Subtitler — Windows Build
 echo.
 echo ============================================================
 echo   Video Subtitler — Windows Build Script
+echo   Repo: https://github.com/alal76/subtitle-generator
 echo ============================================================
 echo.
 
-:: ── working directory = script location ─────────────────────────────────────
-cd /d "%~dp0"
+:: ── configuration ────────────────────────────────────────────────────────────
+set REPO_URL=https://github.com/alal76/subtitle-generator.git
+set REPO_BRANCH=main
+set PROJECT_DIR=%USERPROFILE%\subtitle-generator
+
+:: ── working directory = user home (clone target) ─────────────────────────────
+cd /d "%USERPROFILE%"
 
 :: ============================================================
 :: 1. Check for winget (Windows Package Manager)
@@ -23,9 +29,49 @@ if errorlevel 1 (
 )
 
 :: ============================================================
-:: 2. Install / verify Python 3.11
+:: 2. Install / verify Git
 :: ============================================================
-echo [1/6] Checking Python...
+echo [1/7] Checking Git...
+where git >nul 2>&1
+if errorlevel 1 (
+    echo       Git not found — installing via winget...
+    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements
+    if errorlevel 1 (
+        echo [ERROR] Git installation failed. Install manually from https://git-scm.com
+        pause & exit /b 1
+    )
+    :: Refresh PATH
+    set "PATH=%PATH%;C:\Program Files\Git\cmd"
+)
+for /f "tokens=3" %%v in ('git --version') do echo       Found Git %%v
+
+:: ============================================================
+:: 3. Clone or update the repository
+:: ============================================================
+echo [2/7] Cloning / updating repository...
+if exist "%PROJECT_DIR%\.git" (
+    echo       Repo already exists — pulling latest changes...
+    cd /d "%PROJECT_DIR%"
+    git pull origin %REPO_BRANCH%
+    if errorlevel 1 (
+        echo [ERROR] git pull failed.
+        pause & exit /b 1
+    )
+) else (
+    echo       Cloning %REPO_URL%...
+    git clone --branch %REPO_BRANCH% --depth 1 "%REPO_URL%" "%PROJECT_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] git clone failed. Check your internet connection and repo URL.
+        pause & exit /b 1
+    )
+    cd /d "%PROJECT_DIR%"
+)
+echo       Source ready at %PROJECT_DIR%
+
+:: ============================================================
+:: 4. Install / verify Python 3.11
+:: ============================================================
+echo [3/7] Checking Python...
 where python >nul 2>&1
 if errorlevel 1 (
     echo       Python not found — installing via winget...
@@ -45,17 +91,21 @@ for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PY_VER=%%v
 echo       Found Python !PY_VER! at !PYTHON_EXE!
 
 :: ============================================================
-:: 3. Install / verify ffmpeg
+:: 5. Install / verify ffmpeg
 :: ============================================================
-echo [2/6] Checking ffmpeg...
-if exist "ffmpeg.exe" (
-    echo       Found bundled ffmpeg.exe in project folder.
+echo [4/7] Checking ffmpeg...
+if exist "%PROJECT_DIR%\ffmpeg.exe" (
+    echo       Found bundled ffmpeg.exe — skipping download.
+    set FFMPEG_READY=1
+) else if exist "ffmpeg.exe" (
+    echo       Found ffmpeg.exe in current folder.
+    copy "ffmpeg.exe" "%PROJECT_DIR%\ffmpeg.exe" >nul 2>&1
     set FFMPEG_READY=1
 ) else (
     where ffmpeg >nul 2>&1
     if not errorlevel 1 (
         echo       Found ffmpeg on PATH — copying to project folder for bundling...
-        for /f "tokens=*" %%i in ('where ffmpeg') do copy "%%i" "ffmpeg.exe" >nul
+        for /f "tokens=*" %%i in ('where ffmpeg') do copy "%%i" "%PROJECT_DIR%\ffmpeg.exe" >nul
         set FFMPEG_READY=1
     ) else (
         echo       ffmpeg not found — installing via winget...
@@ -66,7 +116,7 @@ if exist "ffmpeg.exe" (
         ) else (
             :: Refresh PATH
             for /f "tokens=*" %%i in ('where ffmpeg 2^>nul') do (
-                copy "%%i" "ffmpeg.exe" >nul
+                copy "%%i" "%PROJECT_DIR%\ffmpeg.exe" >nul
                 set FFMPEG_READY=1
             )
         )
@@ -76,14 +126,15 @@ if exist "ffmpeg.exe" (
 if not defined FFMPEG_READY (
     echo [ERROR] Could not locate or install ffmpeg.
     echo         Download manually from https://ffmpeg.org/download.html
-    echo         Place ffmpeg.exe in: %CD%
+    echo         Place ffmpeg.exe in: %PROJECT_DIR%
     pause & exit /b 1
 )
+cd /d "%PROJECT_DIR%"
 
 :: ============================================================
-:: 4. Create virtual environment
+:: 6. Create virtual environment
 :: ============================================================
-echo [3/6] Setting up virtual environment...
+echo [5/7] Setting up virtual environment...
 if not exist ".venv\Scripts\activate.bat" (
     python -m venv .venv
     if errorlevel 1 (
@@ -98,9 +149,9 @@ if not exist ".venv\Scripts\activate.bat" (
 call .venv\Scripts\activate.bat
 
 :: ============================================================
-:: 5. Install Python dependencies + PyInstaller
+:: 7. Install Python dependencies + PyInstaller
 :: ============================================================
-echo [4/6] Installing Python packages...
+echo [6/7] Installing Python packages...
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt
 if errorlevel 1 (
@@ -115,9 +166,9 @@ if errorlevel 1 (
 echo       All packages installed.
 
 :: ============================================================
-:: 6. Build the executable
+:: 8. Build the executable
 :: ============================================================
-echo [5/6] Building executable with PyInstaller...
+echo [7/7] Building executable with PyInstaller...
 if exist "build" rmdir /s /q "build"
 if exist "dist"  rmdir /s /q "dist"
 
@@ -129,10 +180,10 @@ if errorlevel 1 (
 )
 
 :: ============================================================
-:: 7. Verify output
+:: 9. Verify output
 :: ============================================================
-echo [6/6] Verifying output...
-set EXE=dist\VideoSubtitler\VideoSubtitler.exe
+echo Verifying output...
+set EXE=%PROJECT_DIR%\dist\VideoSubtitler\VideoSubtitler.exe
 if not exist "%EXE%" (
     echo [ERROR] Expected executable not found: %EXE%
     pause & exit /b 1
@@ -145,7 +196,8 @@ echo.
 echo ============================================================
 echo   BUILD SUCCESSFUL
 echo ============================================================
-echo   Executable : %CD%\%EXE%
+echo   Repo       : https://github.com/alal76/subtitle-generator
+ echo   Executable : %EXE%
 echo.
 echo   To run     : double-click VideoSubtitler.exe
 echo                (or run it from this terminal)
@@ -157,7 +209,7 @@ echo.
 
 :: Optional: open the dist folder in Explorer
 set /p OPEN_DIST="Open dist folder in Explorer? [Y/n]: "
-if /i not "!OPEN_DIST!"=="n" explorer "%CD%\dist\VideoSubtitler"
+if /i not "!OPEN_DIST!"=="n" explorer "%PROJECT_DIR%\dist\VideoSubtitler"
 
 pause
 exit /b 0
@@ -186,7 +238,7 @@ powershell -NoProfile -Command ^
 
 :: The zip has a versioned subdirectory — find ffmpeg.exe recursively
 for /r "ffmpeg_tmp" %%f in (ffmpeg.exe) do (
-    copy "%%f" "ffmpeg.exe" >nul
+    copy "%%f" "%PROJECT_DIR%\ffmpeg.exe" >nul
     set FFMPEG_READY=1
 )
 
