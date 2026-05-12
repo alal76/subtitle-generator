@@ -42,9 +42,21 @@ def find_ffmpeg():
 FFMPEG_SRC = find_ffmpeg()
 FFMPEG_DST = "ffmpeg.exe" if IS_WIN else "ffmpeg"
 
+def find_ffprobe():
+    """Locate ffprobe alongside ffmpeg."""
+    ffmpeg_dir = os.path.dirname(FFMPEG_SRC)
+    name = "ffprobe.exe" if IS_WIN else "ffprobe"
+    p = os.path.join(ffmpeg_dir, name)
+    if os.path.isfile(p):
+        return p
+    return None  # optional — runtime falls back to PATH
+
+FFPROBE_SRC = find_ffprobe()
+
 # ── data files ──────────────────────────────────────────────────────────────
 datas = [
     (FFMPEG_SRC, "."),                                            # ffmpeg binary
+    *([(FFPROBE_SRC, ".")] if FFPROBE_SRC else []),               # ffprobe (if found)
     (str(SP / "faster_whisper"),    "faster_whisper"),
     (str(SP / "ctranslate2"),       "ctranslate2"),
     (str(SP / "argostranslate"),    "argostranslate"),
@@ -56,6 +68,8 @@ datas = [
     (str(SP / "markupsafe"),        "markupsafe"),
     (str(SP / "edge_tts"),          "edge_tts"),
     (str(SP / "pydub"),             "pydub"),
+    (str(SP / "librosa"),           "librosa"),
+    (str(SP / "sklearn"),           "sklearn"),
 ]
 
 # ── hidden imports ───────────────────────────────────────────────────────────
@@ -77,6 +91,12 @@ hidden = [
     "pydub",
     "aiohttp",
     "aiofiles",
+    "librosa",
+    "sklearn",
+    "sklearn.cluster",
+    "sklearn.preprocessing",
+    "scipy",
+    "soundfile",
 ]
 
 # ── analysis ─────────────────────────────────────────────────────────────────

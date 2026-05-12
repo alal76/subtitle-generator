@@ -3,3 +3,5 @@ flask>=3.0.0
 argostranslate==1.9.6
 edge-tts>=6.1.9
 pydub>=0.25.1
+librosa>=0.10.0
+scikit-learn>=1.3.0

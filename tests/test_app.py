@@ -518,7 +518,8 @@ class TestEnsureTranslation:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunJobCleanup:
-    def test_video_file_deleted_on_success(self, tmp_path):
+    def test_video_file_kept_on_success(self, tmp_path):
+        """Video is intentionally kept after successful transcription (for muxing)."""
         video = tmp_path / "test.mp4"
         video.write_bytes(b"fake video")
 
@@ -543,7 +544,9 @@ class TestRunJobCleanup:
             t.start()
             t.join(timeout=10)
 
-        assert not video.exists(), "Input video file should be deleted after job completes"
+        # Video is kept on success so the user can mux the dubbed audio into it
+        assert video.exists(), "Input video file should be kept after successful job (needed for muxing)"
+        assert app._jobs[jid]["video_path"] == str(video)
 
     def test_video_file_deleted_on_failure(self, tmp_path):
         video = tmp_path / "test.mp4"
@@ -584,3 +587,149 @@ class TestRunJobCleanup:
         audio_path = app._jobs[jid].get("audio_path")
         # audio_path is not set on failure (job["audio_path"] is never assigned)
         assert audio_path is None or not os.path.exists(audio_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New feature routes — speakers, media_info, voices, mux
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSpeakersRoute:
+    def test_unknown_job_returns_404(self, client):
+        resp = client.get("/speakers/nonexistent")
+        assert resp.status_code == 404
+
+    def test_not_ready_returns_202(self, client):
+        jid = str(uuid.uuid4())
+        app._jobs[jid] = {"queue": queue.Queue(), "result": None, "error": None}
+        resp = client.get(f"/speakers/{jid}")
+        assert resp.status_code == 202
+
+    def test_returns_speakers_when_ready(self, client):
+        jid = str(uuid.uuid4())
+        app._jobs[jid] = {
+            "queue": queue.Queue(),
+            "result": {"langs": {}, "segments": {}},
+            "error": None,
+            "speakers": {"SPEAKER_00": {"gender_hint": "M", "segment_count": 5,
+                                        "total_duration": 10.0, "median_f0": 120.0}},
+        }
+        resp = client.get(f"/speakers/{jid}")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "speakers" in data
+        assert "SPEAKER_00" in data["speakers"]
+        assert data["diarization_available"] is True
+
+
+class TestMediaInfoRoute:
+    def test_unknown_job_returns_404(self, client):
+        resp = client.get("/media_info/nonexistent")
+        assert resp.status_code == 404
+
+    def test_no_video_path_returns_404(self, client):
+        jid = str(uuid.uuid4())
+        app._jobs[jid] = {"queue": queue.Queue(), "result": None, "error": None}
+        resp = client.get(f"/media_info/{jid}")
+        assert resp.status_code == 404
+
+    def test_runs_ffprobe_on_valid_job(self, client, tmp_path):
+        video = tmp_path / "sample.mp4"
+        video.write_bytes(b"fake")
+        jid = str(uuid.uuid4())
+        app._jobs[jid] = {
+            "queue": queue.Queue(), "result": {}, "error": None,
+            "video_path": str(video),
+        }
+        fake_probe = {"format": {"duration": "10.0", "size": "102400"}, "streams": []}
+        with patch("app._run_ffprobe", return_value=fake_probe):
+            resp = client.get(f"/media_info/{jid}")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "format" in data
+
+
+class TestMuxRoute:
+    def test_unknown_job_returns_404(self, client):
+        resp = client.post("/mux/nojob/nodub", json={"mode": "replace"})
+        assert resp.status_code == 404
+
+    def test_dub_not_complete_returns_400(self, client):
+        jid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+        app._jobs[jid] = {"queue": queue.Queue(), "result": {}, "error": None,
+                          "video_path": "/some/path.mp4"}
+        app._dub_jobs[did] = {"queue": queue.Queue(), "result_path": None, "error": None}
+        resp = client.post(f"/mux/{jid}/{did}", json={"mode": "replace"})
+        assert resp.status_code == 400
+
+    def test_invalid_mode_returns_400(self, client, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"v")
+        audio = tmp_path / "a.mp3"
+        audio.write_bytes(b"a")
+        jid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+        app._jobs[jid] = {"queue": queue.Queue(), "result": {}, "error": None,
+                          "video_path": str(video)}
+        app._dub_jobs[did] = {"queue": queue.Queue(), "result_path": str(audio), "error": None}
+        resp = client.post(f"/mux/{jid}/{did}", json={"mode": "bad"})
+        assert resp.status_code == 400
+
+    def test_valid_mux_starts_job(self, client, tmp_path):
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"v")
+        audio = tmp_path / "a.mp3"
+        audio.write_bytes(b"a")
+        jid = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+        app._jobs[jid] = {"queue": queue.Queue(), "result": {}, "error": None,
+                          "video_path": str(video)}
+        app._dub_jobs[did] = {"queue": queue.Queue(), "result_path": str(audio), "error": None}
+        with patch("threading.Thread"):
+            resp = client.post(f"/mux/{jid}/{did}", json={"mode": "replace"})
+        assert resp.status_code == 200
+        assert "mux_id" in resp.get_json()
+
+
+class TestDubRouteVoiceProfiles:
+    def test_dub_accepts_voice_profiles_json(self, client):
+        jid = str(uuid.uuid4())
+        app._jobs[jid] = {
+            "queue": queue.Queue(),
+            "result": {"langs": {"en": {}}, "segments": {"en": [(0, 1, "hi")]}},
+            "error": None,
+        }
+        body = {"voice_profiles": {"SPEAKER_00": {"voice": "en-US-GuyNeural",
+                                                   "rate": "+2%", "pitch": "+1Hz"}}}
+        with patch("threading.Thread"):
+            resp = client.post(f"/dub/{jid}/en",
+                               data=json.dumps(body),
+                               content_type="application/json")
+        assert resp.status_code == 200
+        assert "dub_id" in resp.get_json()
+
+
+class TestDiarize:
+    def test_fallback_without_librosa(self):
+        """_diarize falls back gracefully if sklearn/librosa are unavailable."""
+        segs = [(0.0, 1.0, "hello"), (1.0, 2.0, "world")]
+        with patch.dict("sys.modules", {"librosa": None, "sklearn": None,
+                                        "sklearn.cluster": None,
+                                        "sklearn.preprocessing": None}):
+            with patch("builtins.__import__", side_effect=ImportError):
+                speakers, spk_segs = app._diarize("fake.wav", segs)
+        assert "SPEAKER_00" in speakers
+        assert len(spk_segs) == len(segs)
+
+    def test_build_speaker_dicts(self):
+        """_build_speaker_dicts returns valid speaker and seg structures."""
+        import numpy as np
+        segs = [(0.0, 1.5, "a"), (1.5, 3.0, "b"), (3.0, 4.5, "c")]
+        labels = np.array([0, 1, 0])
+        f0 = [120.0, 220.0, 115.0]
+        speakers, spk_segs = app._build_speaker_dicts(segs, labels, f0)
+        assert "SPEAKER_00" in speakers
+        assert "SPEAKER_01" in speakers
+        assert speakers["SPEAKER_00"]["gender_hint"] == "M"
+        assert speakers["SPEAKER_01"]["gender_hint"] == "F"
+        assert len(spk_segs) == 3
