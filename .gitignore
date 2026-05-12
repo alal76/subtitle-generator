@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+
+# Virtual environment
+.venv/
+
+# PyInstaller build artefacts
+build/
+dist/
+
+# Local caches (whisper models, argostranslate packages)
+.local_cache/
+
+# macOS
+.DS_Store
+*.DS_Store
+__MACOSX/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+
+# Temp
+*.tmp
+*.log
