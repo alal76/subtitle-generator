@@ -36,6 +36,7 @@ def _find_ffmpeg() -> str:
 
 FFMPEG = _find_ffmpeg()
 
+import asyncio
 import json
 import queue
 import subprocess
@@ -75,7 +76,31 @@ TRANSLATE_LANGUAGES = [
 LANG_NAME = dict(WHISPER_LANGUAGES)
 LANG_NAME.update(dict(TRANSLATE_LANGUAGES))
 
+# Default edge-tts neural voice for each supported language
+EDGE_TTS_VOICES = {
+    "en": "en-US-JennyNeural",
+    "es": "es-ES-ElviraNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "it": "it-IT-ElsaNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "nl": "nl-NL-ColetteNeural",
+    "pl": "pl-PL-ZofiaNeural",
+    "ru": "ru-RU-SvetlanaNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ar": "ar-EG-SalmaNeural",
+    "tr": "tr-TR-EmelNeural",
+    "sv": "sv-SE-SofieNeural",
+    "da": "da-DK-ChristelNeural",
+    "fi": "fi-FI-NooraNeural",
+    "no": "nb-NO-PernilleNeural",
+    "he": "he-IL-HilaNeural",
+}
+
 _jobs: dict = {}
+_dub_jobs: dict = {}
 _pkg_index_fetched = False
 _pkg_index_lock = threading.Lock()
 
@@ -153,30 +178,35 @@ def _push(q, event: str, data: str):
 def _run_job(job_id: str, video_path: str, model_size: str, language: str, translate_to: list):
     job = _jobs[job_id]
     q = job["queue"]
+    audio_dir = os.path.join(_LOCAL_CACHE, "audio")
+    os.makedirs(audio_dir, exist_ok=True)
+    audio_path = os.path.join(audio_dir, f"{job_id}.wav")
     try:
         _push(q, "progress", json.dumps({"msg": "Extracting audio\u2026", "pct": 5}))
-        with tempfile.TemporaryDirectory() as tmp:
-            audio = os.path.join(tmp, "audio.wav")
-            r = subprocess.run(
-                [FFMPEG, "-y", "-i", video_path,
-                 "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio],
-                capture_output=True,
-            )
-            if r.returncode != 0:
-                raise RuntimeError(f"ffmpeg error: {r.stderr.decode()}")
+        r = subprocess.run(
+            [FFMPEG, "-y", "-i", video_path,
+             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg error: {r.stderr.decode()}")
 
-            _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019\u2026", "pct": 20}))
-            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019\u2026", "pct": 20}))
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
-            lang = None if language == "auto" else language
-            _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
-            segs_gen, info = model.transcribe(audio, language=lang, beam_size=5)
-            raw_segments = list(segs_gen)
+        lang = None if language == "auto" else language
+        _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
+        segs_gen, info = model.transcribe(audio_path, language=lang, beam_size=5)
+        raw_segments = list(segs_gen)
 
         detected = info.language
         segs = [(s.start, s.end, s.text.strip()) for s in raw_segments]
 
+        # Keep audio for the dubbing feature
+        job["audio_path"] = audio_path
+
         _push(q, "progress", json.dumps({"msg": "Building original subtitles\u2026", "pct": 75}))
+        raw_segs_by_lang = {detected: segs}
         langs_result = {
             detected: {
                 "plain": "\n".join(t for _, _, t in segs),
@@ -194,6 +224,7 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             name = LANG_NAME.get(tgt, tgt)
             _push(q, "progress", json.dumps({"msg": f"Translating to {name}\u2026", "pct": pct}))
             translated_segs = _translate_segs(segs, detected, tgt)
+            raw_segs_by_lang[tgt] = translated_segs
             langs_result[tgt] = {
                 "plain": "\n".join(t for _, _, t in translated_segs),
                 "srt": _build_srt(translated_segs),
@@ -206,6 +237,7 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             "detected_language_name": LANG_NAME.get(detected, detected),
             "segment_count": len(segs),
             "langs": langs_result,
+            "segments": raw_segs_by_lang,  # timed (start, end, text) per lang — used by dubbing
         }
         _push(q, "done", json.dumps({"msg": "Done!"}))
     except Exception as exc:
@@ -214,6 +246,102 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
     finally:
         if os.path.exists(video_path):
             os.unlink(video_path)
+        # audio_path is intentionally kept for the dubbing feature
+        q.put(None)
+
+
+# ── dubbing helpers ────────────────────────────────────────────────────────────
+
+async def _tts_generate(text: str, voice: str, output_path: str):
+    """Generate one TTS segment and save as MP3 via edge-tts."""
+    import edge_tts  # lazy import — only needed for dubbing
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+
+
+def _dub_job(dub_id: str, job_id: str, lang: str):
+    """
+    Background thread that builds a dubbed audio track.
+
+    Pipeline:
+      1. Load the original 16-kHz WAV kept from transcription.
+      2. Duck (–20 dB) the speech segments so background music stays audible.
+      3. Generate TTS for every translated segment via edge-tts.
+      4. Overlay each TTS clip at its original start timestamp.
+      5. Export as 128 kbps MP3.
+    """
+    dub = _dub_jobs[dub_id]
+    q = dub["queue"]
+    try:
+        job = _jobs.get(job_id)
+        if not job or not job.get("result"):
+            raise RuntimeError("Source transcription job not found or not complete.")
+
+        audio_path = job.get("audio_path")
+        if not audio_path or not os.path.exists(audio_path):
+            raise RuntimeError(
+                "Original audio is no longer available. Re-run transcription to enable dubbing."
+            )
+
+        raw_segs = job["result"].get("segments", {}).get(lang)
+        if not raw_segs:
+            raise RuntimeError(f"No timed segments found for language '{lang}'.")
+
+        voice = EDGE_TTS_VOICES.get(lang, "en-US-JennyNeural")
+
+        _push(q, "progress", json.dumps({"msg": "Loading audio\u2026", "pct": 5}))
+        from pydub import AudioSegment  # lazy import — only needed for dubbing
+
+        orig_audio = AudioSegment.from_wav(audio_path)
+
+        # Duck the original audio during each speech window so the background
+        # score is preserved but the original voice is suppressed.
+        _push(q, "progress", json.dumps({"msg": "Ducking original speech\u2026", "pct": 10}))
+        ducked = orig_audio
+        for start, end, _ in raw_segs:
+            s_ms = int(start * 1000)
+            e_ms = min(int(end * 1000), len(ducked))
+            if s_ms >= e_ms:
+                continue
+            chunk = ducked[s_ms:e_ms] - 20  # −20 dB during speech
+            ducked = ducked[:s_ms] + chunk + ducked[e_ms:]
+
+        result_audio = ducked
+        total = len(raw_segs)
+        _push(q, "progress", json.dumps({"msg": f"Generating TTS (0/{total})\u2026", "pct": 15}))
+
+        for i, (start, end, text) in enumerate(raw_segs):
+            pct = 15 + int(75 * (i + 1) / max(total, 1))
+            _push(q, "progress", json.dumps({
+                "msg": f"Generating speech {i + 1}/{total}\u2026", "pct": pct
+            }))
+            if not text.strip():
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                tts_path = tf.name
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_tts_generate(text, voice, tts_path))
+                finally:
+                    loop.close()
+                tts_seg = AudioSegment.from_mp3(tts_path)
+                result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
+            finally:
+                if os.path.exists(tts_path):
+                    os.unlink(tts_path)
+
+        _push(q, "progress", json.dumps({"msg": "Exporting MP3\u2026", "pct": 93}))
+        out_dir = os.path.join(_LOCAL_CACHE, "audio")
+        out_path = os.path.join(out_dir, f"{dub_id}_{lang}.mp3")
+        result_audio.export(out_path, format="mp3", bitrate="128k")
+
+        dub["result_path"] = out_path
+        _push(q, "done", json.dumps({"msg": "Dubbed audio ready!"}))
+    except Exception as exc:
+        dub["error"] = str(exc)
+        _push(q, "error", json.dumps({"msg": str(exc)}))
+    finally:
         q.put(None)
 
 
@@ -311,6 +439,54 @@ def download(job_id: str, lang: str, fmt: str):
     return send_file(tmp.name, as_attachment=True, download_name=f"subtitles_{lang}.{fmt}")
 
 
+@app.route("/dub/<job_id>/<lang>", methods=["POST"])
+def start_dub(job_id: str, lang: str):
+    job = _jobs.get(job_id)
+    if not job or not job.get("result"):
+        return jsonify(error="Transcription job not found"), 404
+    if lang not in job["result"].get("langs", {}):
+        return jsonify(error="Language not available for this job"), 400
+    dub_id = str(uuid.uuid4())
+    _dub_jobs[dub_id] = {"queue": queue.Queue(), "result_path": None, "error": None}
+    threading.Thread(
+        target=_dub_job,
+        args=(dub_id, job_id, lang),
+        daemon=True,
+    ).start()
+    return jsonify(dub_id=dub_id)
+
+
+@app.route("/stream_dub/<dub_id>")
+def stream_dub(dub_id: str):
+    dub = _dub_jobs.get(dub_id)
+    if not dub:
+        return jsonify(error="Unknown dub job"), 404
+
+    def generate():
+        q = dub["queue"]
+        while True:
+            msg = q.get()
+            if msg is None:
+                break
+            yield msg
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/download_dub/<dub_id>")
+def download_dub(dub_id: str):
+    dub = _dub_jobs.get(dub_id)
+    if not dub:
+        return jsonify(error="Not found"), 404
+    if dub["error"]:
+        return jsonify(error=dub["error"]), 500
+    path = dub.get("result_path")
+    if not path or not os.path.exists(path):
+        return jsonify(error="Audio not ready"), 202
+    return send_file(path, as_attachment=True, download_name="dubbed_audio.mp3")
+
+
 # ── HTML template ──────────────────────────────────────────────────────────────
 
 HTML_UI = r"""<!DOCTYPE html>
@@ -364,6 +540,8 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
 .dl-btn{background:#0f4c75;color:#7dd3fc;border:1px solid #0369a1;border-radius:6px;padding:.4rem 1rem;font-size:.82rem;text-decoration:none;display:inline-block;transition:background .15s}
 .dl-btn:hover{background:#0369a1}
 .error-box{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5;border-radius:8px;padding:.75rem 1rem;font-size:.9rem;display:none;margin-top:.75rem}
+.dub-note{font-size:.82rem;color:#64748b;line-height:1.6;margin-bottom:.75rem}
+.success-msg{color:#4ade80;font-size:.9rem;margin-bottom:.5rem}
 </style>
 </head>
 <body>
@@ -454,6 +632,28 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
     </div>
     <textarea id="text-out" rows="16" readonly></textarea>
     <div class="dl-bar" id="dl-bar"></div>
+  </div>
+
+  <!-- Step 6: Dub Audio -->
+  <div class="card" id="dub-card" style="display:none">
+    <h2>6 &mdash; Dub Audio <span style="color:#94a3b8;font-weight:400">(replaces dialogue with AI voice)</span></h2>
+    <p class="dub-note">Generates a new audio track in the selected language: background music and sound effects are preserved (briefly ducked during speech), and all dialogue is replaced with neural text-to-speech. Internet access required for voice synthesis.</p>
+    <div class="row" style="align-items:flex-end">
+      <div class="field">
+        <label for="dub-lang-sel">Target language</label>
+        <select id="dub-lang-sel"></select>
+      </div>
+      <button class="btn" id="dub-btn" style="margin-bottom:1px">Generate dubbed audio</button>
+    </div>
+    <div id="dub-prog-wrap" style="display:none;margin-top:1rem">
+      <div class="progress-bar-bg"><div class="progress-bar" id="dub-prog-bar"></div></div>
+      <div class="progress-msg" id="dub-prog-msg">Starting&hellip;</div>
+    </div>
+    <div class="error-box" id="dub-error-box"></div>
+    <div id="dub-result-area" style="display:none;margin-top:1rem">
+      <p class="success-msg">&checkmark; Dubbed audio ready</p>
+      <a id="dub-dl-btn" class="dl-btn" href="#">&#11015; Download dubbed audio (.mp3)</a>
+    </div>
   </div>
 </main>
 
@@ -581,6 +781,7 @@ function showResults(jid, data) {
 
   renderText();
   renderDownloads();
+  initDubCard(data);
   resultsCard.style.display = "block";
   runBtn.disabled = false;
 }
@@ -609,6 +810,87 @@ function renderDownloads() {
     a.textContent = `\u2b07 ${name} .${fmt}`;
     dlBar.appendChild(a);
   }
+}
+
+// ── Dub Audio ─────────────────────────────────────────────────────────────────
+const dubCard       = document.getElementById("dub-card");
+const dubLangSel    = document.getElementById("dub-lang-sel");
+const dubBtn        = document.getElementById("dub-btn");
+const dubProgWrap   = document.getElementById("dub-prog-wrap");
+const dubProgBar    = document.getElementById("dub-prog-bar");
+const dubProgMsg    = document.getElementById("dub-prog-msg");
+const dubErrorBox   = document.getElementById("dub-error-box");
+const dubResultArea = document.getElementById("dub-result-area");
+const dubDlBtn      = document.getElementById("dub-dl-btn");
+const dubLangNames  = {
+  en:"English",es:"Spanish",fr:"French",de:"German",it:"Italian",pt:"Portuguese",
+  nl:"Dutch",pl:"Polish",ru:"Russian",ja:"Japanese",ko:"Korean",zh:"Chinese",
+  ar:"Arabic",tr:"Turkish",sv:"Swedish",da:"Danish",fi:"Finnish",no:"Norwegian",he:"Hebrew"
+};
+
+function initDubCard(data) {
+  dubLangSel.innerHTML = "";
+  for (const code of Object.keys(data.langs)) {
+    const opt = document.createElement("option");
+    opt.value = code;
+    opt.textContent = (dubLangNames[code] || code) +
+                      (code === data.detected_language ? " (original)" : "");
+    dubLangSel.appendChild(opt);
+  }
+  dubProgWrap.style.display  = "none";
+  dubErrorBox.style.display  = "none";
+  dubResultArea.style.display = "none";
+  dubBtn.disabled = false;
+  dubCard.style.display = "block";
+}
+
+dubBtn.addEventListener("click", async () => {
+  const lang = dubLangSel.value;
+  if (!jobId || !lang) return;
+  dubErrorBox.style.display  = "none";
+  dubResultArea.style.display = "none";
+  dubProgWrap.style.display  = "block";
+  dubProgBar.style.width = "0%";
+  dubProgMsg.textContent = "Starting\u2026";
+  dubBtn.disabled = true;
+
+  let resp;
+  try { resp = await fetch(`/dub/${jobId}/${lang}`, { method: "POST" }); }
+  catch (e) { showDubError("Request failed: " + e.message); return; }
+  if (!resp.ok) {
+    const j = await resp.json().catch(() => ({}));
+    showDubError(j.error || "Failed to start dub job");
+    return;
+  }
+  const { dub_id } = await resp.json();
+
+  const es = new EventSource(`/stream_dub/${dub_id}`);
+  es.addEventListener("progress", e => {
+    const d = JSON.parse(e.data);
+    dubProgMsg.textContent = d.msg;
+    dubProgBar.style.width = (d.pct || 0) + "%";
+  });
+  es.addEventListener("done", () => {
+    es.close();
+    dubProgBar.style.width = "100%";
+    dubProgMsg.textContent = "Done!";
+    const name = dubLangNames[lang] || lang;
+    dubDlBtn.textContent = `\u2b07 Download dubbed audio \u2014 ${name} (.mp3)`;
+    dubDlBtn.href = `/download_dub/${dub_id}`;
+    dubResultArea.style.display = "block";
+    dubBtn.disabled = false;
+  });
+  es.addEventListener("error", e => {
+    es.close();
+    try { showDubError(JSON.parse(e.data).msg); } catch(_) { showDubError("Dubbing failed."); }
+  });
+});
+
+function showDubError(msg) {
+  dubProgWrap.style.display = "none";
+  dubErrorBox.textContent = msg;
+  dubErrorBox.style.display = "block";
+  dubBtn.disabled = false;
 }
 </script>
 </body>

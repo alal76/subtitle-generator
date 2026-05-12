@@ -54,6 +54,8 @@ datas = [
     (str(SP / "click"),             "click"),
     (str(SP / "itsdangerous"),      "itsdangerous"),
     (str(SP / "markupsafe"),        "markupsafe"),
+    (str(SP / "edge_tts"),          "edge_tts"),
+    (str(SP / "pydub"),             "pydub"),
 ]
 
 # ── hidden imports ───────────────────────────────────────────────────────────
@@ -71,6 +73,10 @@ hidden = [
     "tokenizers",
     "numpy",
     "av",
+    "edge_tts",
+    "pydub",
+    "aiohttp",
+    "aiofiles",
 ]
 
 # ── analysis ─────────────────────────────────────────────────────────────────
