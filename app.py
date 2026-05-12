@@ -12,7 +12,7 @@ import sys
 if getattr(sys, "frozen", False):
     # Frozen (PyInstaller): place data next to the executable
     _PROJECT_DIR = os.path.dirname(sys.executable)
-    _BUNDLE_DIR  = sys._MEIPASS  # where PyInstaller extracts bundled files
+    _BUNDLE_DIR  = getattr(sys, "_MEIPASS", _PROJECT_DIR)
 else:
     _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
     _BUNDLE_DIR  = _PROJECT_DIR
@@ -37,6 +37,7 @@ def _find_ffmpeg() -> str:
 FFMPEG = _find_ffmpeg()
 
 import asyncio
+import io
 import json
 import queue
 import subprocess
@@ -149,7 +150,7 @@ def _ensure_translation(from_code: str, to_code: str):
     for lang in argostranslate.translate.get_installed_languages():
         if lang.code == from_code:
             for tl in lang.translations_to:
-                if tl.code == to_code:
+                if tl.to_lang.code == to_code:
                     return
     _ensure_pkg_index()
     available = argostranslate.package.get_available_packages()
@@ -243,10 +244,13 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
     except Exception as exc:
         job["error"] = str(exc)
         _push(q, "error", json.dumps({"msg": str(exc)}))
+        # Audio won't be used for dubbing on a failed job — clean it up
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
     finally:
         if os.path.exists(video_path):
             os.unlink(video_path)
-        # audio_path is intentionally kept for the dubbing feature
+        # audio_path is intentionally kept on success for the dubbing feature
         q.put(None)
 
 
@@ -347,7 +351,7 @@ def _dub_job(dub_id: str, job_id: str, lang: str):
 
 # ── routes ─────────────────────────────────────────────────────────────────────
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
     return render_template_string(
         HTML_UI,
@@ -391,7 +395,7 @@ def transcribe():
     return jsonify(job_id=job_id)
 
 
-@app.route("/stream/<job_id>")
+@app.route("/stream/<job_id>", methods=["GET"])
 def stream(job_id: str):
     job = _jobs.get(job_id)
     if not job:
@@ -409,7 +413,7 @@ def stream(job_id: str):
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.route("/result/<job_id>")
+@app.route("/result/<job_id>", methods=["GET"])
 def result(job_id: str):
     job = _jobs.get(job_id)
     if not job:
@@ -421,7 +425,7 @@ def result(job_id: str):
     return jsonify(job["result"])
 
 
-@app.route("/download/<job_id>/<lang>/<fmt>")
+@app.route("/download/<job_id>/<lang>/<fmt>", methods=["GET"])
 def download(job_id: str, lang: str, fmt: str):
     job = _jobs.get(job_id)
     if not job or not job["result"]:
@@ -433,10 +437,13 @@ def download(job_id: str, lang: str, fmt: str):
         return jsonify(error="Language not available"), 404
     key = "plain" if fmt == "txt" else fmt
     content = langs[lang][key]
-    tmp = tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False, mode="w", encoding="utf-8")
-    tmp.write(content)
-    tmp.close()
-    return send_file(tmp.name, as_attachment=True, download_name=f"subtitles_{lang}.{fmt}")
+    buf = io.BytesIO(content.encode("utf-8"))
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=f"subtitles_{lang}.{fmt}",
+        mimetype="text/plain; charset=utf-8",
+    )
 
 
 @app.route("/dub/<job_id>/<lang>", methods=["POST"])
@@ -456,7 +463,7 @@ def start_dub(job_id: str, lang: str):
     return jsonify(dub_id=dub_id)
 
 
-@app.route("/stream_dub/<dub_id>")
+@app.route("/stream_dub/<dub_id>", methods=["GET"])
 def stream_dub(dub_id: str):
     dub = _dub_jobs.get(dub_id)
     if not dub:
@@ -474,7 +481,7 @@ def stream_dub(dub_id: str):
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.route("/download_dub/<dub_id>")
+@app.route("/download_dub/<dub_id>", methods=["GET"])
 def download_dub(dub_id: str):
     dub = _dub_jobs.get(dub_id)
     if not dub:
