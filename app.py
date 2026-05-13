@@ -978,6 +978,30 @@ def system_info():
     return jsonify({"device": _DEVICE, "compute_type": _COMPUTE_TYPE, "label": _DEVICE_LABEL})
 
 
+@app.route("/browse-folder", methods=["GET"])
+def browse_folder():
+    """Open a native OS folder-picker dialog and return the selected path.
+    Uses a subprocess so tkinter always runs on a fresh main thread.
+    """
+    script = (
+        "import tkinter as tk; from tkinter import filedialog; "
+        "root = tk.Tk(); root.withdraw(); "
+        "root.wm_attributes('-topmost', True); "
+        "path = filedialog.askdirectory(title='Select output folder'); "
+        "print(path, end='')"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        path = result.stdout.strip()
+        return jsonify({"path": path})
+    except subprocess.TimeoutExpired:
+        return jsonify({"path": "", "error": "Dialog timed out"})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"path": "", "error": str(exc)})
+
 @app.route("/config", methods=["POST"])
 def set_config():
     if not request.is_json:
@@ -1125,6 +1149,7 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
         <input type="text" id="output-folder" placeholder="/absolute/path/to/output  (leave blank to download manually)"
                style="background:#0f172a;border:1px solid #475569;color:#e2e8f0;border-radius:6px;padding:.5rem .75rem;font-size:.88rem;width:100%"/>
       </div>
+      <button class="btn" id="browse-folder-btn" title="Pick a folder" style="padding:.5rem 1rem;font-size:.85rem;flex-shrink:0;background:#1e293b;border:1px solid #475569">&#128193; Browse…</button>
       <button class="btn" id="set-folder-btn" style="padding:.5rem 1.1rem;font-size:.85rem;flex-shrink:0">Set</button>
     </div>
     <div id="folder-status" style="font-size:.76rem;margin-top:.35rem;color:#64748b"></div>
@@ -1324,7 +1349,32 @@ function log(msg, type = "info") {
 // ── Output folder config ──────────────────────────────────────────────
 const outputFolderInput = document.getElementById("output-folder");
 const setFolderBtn      = document.getElementById("set-folder-btn");
+const browseFolderBtn   = document.getElementById("browse-folder-btn");
 const folderStatus      = document.getElementById("folder-status");
+
+browseFolderBtn.addEventListener("click", async () => {
+  browseFolderBtn.disabled = true;
+  browseFolderBtn.textContent = "\u23F3 Opening\u2026";
+  folderStatus.textContent = "Waiting for folder picker\u2026";
+  folderStatus.style.color = "#94a3b8";
+  try {
+    const r = await fetch("/browse-folder");
+    const j = await r.json();
+    if (j.path) {
+      outputFolderInput.value = j.path;
+      folderStatus.textContent = "";
+    } else {
+      folderStatus.textContent = j.error ? "Error: " + j.error : "No folder selected.";
+      folderStatus.style.color = "#f87171";
+    }
+  } catch (e) {
+    folderStatus.textContent = "Error: " + e.message;
+    folderStatus.style.color = "#f87171";
+  } finally {
+    browseFolderBtn.disabled = false;
+    browseFolderBtn.textContent = "\uD83D\uDCC1 Browse\u2026";
+  }
+});
 
 (async () => {
   try {
