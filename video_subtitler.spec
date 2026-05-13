@@ -1,6 +1,7 @@
 # PyInstaller spec file for Video Subtitler
-# Works on both macOS and Windows — run from the project root with:
+# Works on macOS, Windows, and Linux — run from the project root with:
 #   pyinstaller video_subtitler.spec
+# Or use the build script:  python build.py
 
 import sys
 import os
@@ -8,6 +9,8 @@ from pathlib import Path
 
 IS_WIN   = sys.platform == "win32"
 IS_MAC   = sys.platform == "darwin"
+IS_LIN   = sys.platform.startswith("linux")
+VERSION  = os.environ.get("VS_VERSION", "1.2.0")
 VENV     = Path(".venv")
 SP       = VENV / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
 
@@ -18,8 +21,10 @@ def find_ffmpeg():
         # macOS Homebrew (Apple Silicon / Intel)
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
-        # Linux
+        # Linux (most distros)
         "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/snap/bin/ffmpeg",
     ]
     if IS_WIN:
         # Windows: project folder first (placed by build_windows.bat), then common installs
@@ -95,6 +100,7 @@ hidden = [
     "sklearn",
     "sklearn.cluster",
     "sklearn.preprocessing",
+    "sklearn.metrics",        # silhouette_score for speaker count detection
     "scipy",
     "soundfile",
 ]
@@ -146,8 +152,8 @@ if IS_MAC:
         bundle_identifier="com.videosubtitler.app",
         info_plist={
             "CFBundleDisplayName":        "Video Subtitler",
-            "CFBundleVersion":            "1.0.0",
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion":            VERSION,
+            "CFBundleShortVersionString": VERSION,
             "NSHighResolutionCapable":    True,
         },
     )

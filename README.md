@@ -12,10 +12,12 @@ Everything runs on your machine. No cloud API keys required.
 |---|---|
 | **Transcription** | faster-whisper (tiny → large-v3); CPU int8 |
 | **Translation** | 19 languages, fully offline after first download (~50 MB/pair) |
-| **Subtitle export** | SRT · VTT · plain text |
-| **Speaker diarization** | MFCC + F0 clustering; up to 4 speakers auto-detected |
-| **AI dubbing** | Per-speaker neural voice, rate ±5 %, pitch ±5 Hz via edge-tts |
-| **Audio muxing** | Replace original audio or add dubbed track alongside it |
+| **Subtitle export** | SRT · VTT · plain text; auto-saved to a configured output folder |
+| **Speaker diarization** | MFCC + F0 clustering; silhouette-scored — detects as many speakers as the video contains |
+| **AI dubbing** | Per-speaker neural voice; speed & pitch auto-suggested from acoustic analysis; rate ±20 %, pitch ±10 Hz |
+| **Bitrate matching** | Dubbed audio exported at the same bitrate as the original audio stream |
+| **Video bundling** | MP4 or MKV output; choose original track, dubbed track, or both as separate streams |
+| **Auto-save** | Subtitles, dubbed audio, and bundled video saved automatically to any configured folder |
 | **Media info** | ffprobe stream/format details in a modal popup |
 | **Activity log** | Collapsible live sidebar — timestamps, progress, errors |
 
@@ -132,18 +134,42 @@ The app does **not** auto-open a browser on Linux — navigate to **http://127.0
 ## Workflow
 
 ```
-1 — Upload video      →  select or drag-drop (MP4, MKV, AVI, MOV, WEBM, FLV, M4V, WMV)
-2 — Options           →  Whisper model size, source language
-3 — Translate         →  pick one or more target languages (optional)
-4 — Generate          →  runs transcription + translation
-5 — Results           →  view / download SRT · VTT · TXT per language
-6 — Dub Audio         →  load speaker profiles → assign voices → generate MP3
-                          └─ Mux into video: replace or add audio track → download
+0 — Output Settings  →  set an absolute folder path for auto-save (optional)
+                         subtitles, dubbed audio, and bundled video are written there
+1 — Upload video     →  select or drag-drop (MP4, MKV, AVI, MOV, WEBM, FLV, M4V, WMV)
+                         Media Info button shows codec / resolution / bitrate via ffprobe
+2 — Options          →  Whisper model size, source language
+3 — Translate        →  pick one or more target languages (optional)
+4 — Generate         →  transcription → speaker diarization → translation
+5 — Results          →  view / download SRT · VTT · TXT per language
+                         files also saved to output folder if configured
+6 — Dub Audio        →  Load Speaker Profiles → per-speaker voice, speed, pitch
+                         speed & pitch pre-filled from acoustic analysis of each speaker
+                         Generate dubbed audio (bitrate matched to source)
+                         └─ Bundle into video:
+                              Container:    MP4 or MKV
+                              Audio tracks: ☑ Keep original   ☑ Include dubbed
+                              → Download bundled video
+                              → File also saved to output folder if configured
 ```
 
-**Media Info** button (upload card) — shows codec, resolution, FPS, channels, bitrate via ffprobe. Available as soon as a file is selected.
-
 **Activity Log** sidebar — collapsible live log of every step with timestamps and colour-coded status (progress / success / error).
+
+---
+
+## Output Folder & Auto-Save
+
+The **Output Settings** card at the top of the UI accepts any absolute path. Once set, the app automatically saves:
+
+| File | Naming convention |
+|---|---|
+| Subtitles | `{source_filename}_{lang}.srt` / `.vtt` / `.txt` |
+| Dubbed audio | `{source_filename}_{lang}_dubbed.mp3` |
+| Bundled video | `{source_filename}_bundled.mp4` (or `.mkv`) |
+
+All files are also available for manual download from the UI. Leave the field blank to disable auto-save.
+
+The setting persists for the session and is restored on page reload (`GET /config`).
 
 ---
 
@@ -161,6 +187,37 @@ All downloaded data is stored inside the project folder under `.local_cache/`:
 ```
 
 Delete `.local_cache/` to reclaim disk space and start fresh.
+
+---
+
+## Speaker Diarization & Voice Profiles
+
+Diarization runs entirely on CPU using MFCC features and F0 (fundamental frequency) extraction via librosa.
+
+- **Speaker count** is detected automatically using silhouette scoring — no hard limit. A 2-hour lecture can produce 8+ distinct speakers if the signal supports it.
+- **Gender** is inferred from median F0 (> 165 Hz → Female), which pre-filters the voice dropdown to matching-gender options.
+- For each speaker the app computes **speaking rate** (words/second) and **median pitch** (Hz) and maps them to suggested TTS `rate` and `pitch` offsets. These pre-fill the sliders — you can adjust freely before generating.
+- Sliders range: rate −20 % to +20 %, pitch −10 Hz to +10 Hz.
+
+---
+
+## Audio Bitrate Matching
+
+When the source video is processed, ffprobe reads the original audio stream bitrate. The dubbed MP3 and the bundled AAC track are both encoded at that same bitrate (clamped 64 – 320 kbps, defaulting to 192 kbps if detection fails).
+
+---
+
+## Video Bundling
+
+The **Bundle Options** panel (step 6) offers:
+
+| Option | Effect |
+|---|---|
+| **Container** | MP4 (broad compatibility) or MKV (multi-track, subtitles) |
+| **Keep original audio track(s)** | All source audio streams are copied as-is |
+| **Include dubbed audio track** | TTS audio added as an additional stream |
+
+Selecting both audio options produces a file with both tracks (e.g. English original + Spanish dub), letting media players switch between them.
 
 ---
 
@@ -195,10 +252,11 @@ ffmpeg                    # Audio extraction & video muxing (system binary)
 |---|---|
 | Transcription (faster-whisper) | ✅ Full support |
 | Translation (argostranslate) | ✅ Full support |
-| Subtitle export | ✅ Full support |
+| Subtitle export + auto-save | ✅ Full support |
 | Speaker diarization | ✅ Full support |
 | AI dubbing (edge-tts) | ✅ Requires outbound HTTPS |
-| Audio muxing (ffmpeg) | ✅ Full support |
+| Audio bitrate matching | ✅ Full support |
+| Video bundling (MP4/MKV) | ✅ Full support |
 | Media info (ffprobe) | ✅ Full support |
 | Auto-open browser | ⚠️ May not work on headless servers |
 | PyInstaller standalone build | ⚠️ Untested (likely works; not validated) |

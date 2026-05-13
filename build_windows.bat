@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableDelayedExpansion
-title Video Subtitler — Windows Build
+title Video Subtitler v1.2.0 — Windows Build
 
 echo.
 echo ============================================================
-echo   Video Subtitler — Windows Build Script
+echo   Video Subtitler v1.2.0 — Windows Build Script
 echo   Repo: https://github.com/alal76/subtitle-generator
 echo ============================================================
 echo.
@@ -201,8 +201,16 @@ echo.
 echo ============================================================
 echo   BUILD SUCCESSFUL
 echo ============================================================
+echo   Version    : 1.2.0
 echo   Repo       : https://github.com/alal76/subtitle-generator
- echo   Executable : %EXE%
+echo   Executable : %EXE%
+echo.
+echo   Features in this build:
+echo     - Unlimited speaker diarization (silhouette-scored)
+echo     - Auto-suggested TTS speed + pitch per speaker
+echo     - Output folder auto-save (subtitles, audio, video)
+echo     - Source bitrate-matched dubbed audio
+echo     - MP4 / MKV bundling with independent track selection
 echo.
 echo   To run     : double-click VideoSubtitler.exe
 echo                (or run it from this terminal)
@@ -210,6 +218,13 @@ echo.
 echo   To share   : zip the entire dist\VideoSubtitler\ folder.
 echo                Recipients do NOT need Python or ffmpeg installed.
 echo ============================================================
+echo.
+
+:: Compute SHA-256 checksum for the release
+powershell -NoProfile -Command ^  
+  "$hash = (Get-FileHash '%EXE%' -Algorithm SHA256).Hash;" ^
+  "[IO.File]::WriteAllText('%PROJECT_DIR%\dist\VideoSubtitler\VideoSubtitler.exe.sha256', $hash + '  VideoSubtitler.exe' + [Environment]::NewLine)"
+echo   SHA-256    : written to dist\VideoSubtitler\VideoSubtitler.exe.sha256
 echo.
 
 :: Optional: open the dist folder in Explorer
