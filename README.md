@@ -10,7 +10,7 @@ Everything runs on your machine. No cloud API keys required.
 
 | Feature | Details |
 |---|---|
-| **Transcription** | faster-whisper (tiny → large-v3); CPU int8 |
+| **Transcription** | faster-whisper (tiny → large-v3); GPU (CUDA float16) when available, CPU int8 fallback |
 | **Translation** | 19 languages, fully offline after first download (~50 MB/pair) |
 | **Subtitle export** | SRT · VTT · plain text; auto-saved to a configured output folder |
 | **Speaker diarization** | MFCC + F0 clustering; silhouette-scored — detects as many speakers as the video contains |
@@ -281,6 +281,29 @@ Selecting both audio options produces a file with both tracks (e.g. English orig
 - Dubbing time scales with segment count and network latency to the edge-tts service
 - Speaker diarization runs entirely on CPU using librosa + scikit-learn (no GPU needed)
 
+---
+
+## GPU Acceleration
+
+Whisper transcription automatically uses an **NVIDIA GPU** when one is detected at startup — no configuration required. The device in use is shown as a badge in the app header.
+
+| Scenario | Device used | Speed |
+|---|---|---|
+| NVIDIA GPU (CUDA 12+) | `cuda` — `float16` | 5 – 20× faster than CPU |
+| No GPU / Apple Silicon | `cpu` — `int8` | baseline |
+
+> Apple Silicon MPS is **not yet supported** by the CTranslate2 backend. The app falls back to CPU on M-series Macs and still performs well (int8 quantised).
+
+### Manual GPU setup (if the install script didn't detect your GPU)
+
+```bash
+# Activate the project venv first, then:
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+No CUDA toolkit installation is needed — the runtime libraries are shipped as Python wheels.
+
+```
 ---
 
 ## Dependencies

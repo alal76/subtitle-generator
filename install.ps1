@@ -102,6 +102,22 @@ Ok "Virtual environment ready"
 Info "Installing Python dependencies (may take a minute on first run)…"
 & $VENV_PY -m pip install --quiet --upgrade pip
 & $VENV_PY -m pip install --quiet -r requirements.txt
+
+# ── 4b. Optional CUDA acceleration (NVIDIA GPU) ───────────────────────────────
+$hasCuda = $false
+try {
+    $gpuInfo = & nvidia-smi --query-gpu=name --format=csv,noheader 2>&1
+    if ($LASTEXITCODE -eq 0 -and $gpuInfo) { $hasCuda = $true }
+} catch {}
+
+if ($hasCuda) {
+    Info "NVIDIA GPU detected ($( ($gpuInfo | Select-Object -First 1).Trim() )) — installing CUDA runtime libraries…"
+    & $VENV_PY -m pip install --quiet nvidia-cublas-cu12 nvidia-cudnn-cu12
+    Ok "CUDA runtime libraries installed — Whisper will run on GPU"
+} else {
+    Ok "No NVIDIA GPU detected — using CPU"
+}
+
 Ok "Dependencies installed"
 
 # ── 5. Launch ─────────────────────────────────────────────────────────────────

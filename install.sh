@@ -100,6 +100,19 @@ ok "Virtual environment active"
 info "Installing Python dependencies (this may take a minute on first run)…"
 pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
+
+# ── 5b. Optional CUDA acceleration (NVIDIA GPU) ───────────────────────────────
+# CTranslate2 (the faster-whisper backend) needs CUDA 12 runtime libraries when
+# a GPU is present.  We install them from PyPI so the user needs no local CUDA
+# toolkit — pip pulls the right wheels automatically.
+if command -v nvidia-smi &>/dev/null; then
+  info "NVIDIA GPU detected — installing CUDA runtime libraries for GPU acceleration…"
+  pip install --quiet nvidia-cublas-cu12 nvidia-cudnn-cu12
+  ok "CUDA runtime libraries installed — Whisper will run on GPU"
+else
+  ok "No NVIDIA GPU detected — using CPU (Apple Silicon uses CPU via CTranslate2)"
+fi
+
 ok "Dependencies installed"
 
 # ── 6. Launch ─────────────────────────────────────────────────────────────────

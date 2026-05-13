@@ -116,8 +116,27 @@ EDGE_TTS_VOICES = {
 _jobs: dict = {}
 _dub_jobs: dict = {}
 _mux_jobs: dict = {}
+_config: dict = {"output_folder": ""}
 _pkg_index_fetched = False
 _pkg_index_lock = threading.Lock()
+
+# ── device detection (runs once at startup) ───────────────────────────────────
+def _detect_device() -> tuple[str, str]:
+    """Return (device, compute_type) for WhisperModel.
+
+    Priority: CUDA (NVIDIA) > CPU
+    Apple Silicon MPS is not yet supported by CTranslate2.
+    """
+    try:
+        import ctranslate2  # already a faster-whisper dependency
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+_DEVICE, _COMPUTE_TYPE = _detect_device()
+_DEVICE_LABEL = "GPU (CUDA)" if _DEVICE == "cuda" else "CPU"
 
 # Response-literal constants (suppress duplicate-string warnings)
 _ERR_UNKNOWN_JOB = "Unknown job"
@@ -226,7 +245,8 @@ def _diarize(audio_path: str, segs: list) -> tuple:
         total_dur = sum(e - s for s, e, t in segs)
         return (
             {"SPEAKER_00": {"gender_hint": "U", "segment_count": len(segs),
-                            "total_duration": round(total_dur, 2), "median_f0": 0.0}},
+                            "total_duration": round(total_dur, 2), "median_f0": 0.0,
+                            "speaking_wps": 0.0, "suggested_rate": 0, "suggested_pitch": 0}},
             spk_segs,
         )
 
@@ -249,17 +269,33 @@ def _diarize(audio_path: str, segs: list) -> tuple:
         gender = "F" if f0_per_seg[0] > 165 else "M"
         spk_segs = [(segs[0][0], segs[0][1], segs[0][2], "SPEAKER_00")]
         dur = segs[0][1] - segs[0][0]
+        words = len(segs[0][2].split())
+        wps = words / dur if dur > 0 else 2.5
+        f0_bl = 200.0 if gender == "F" else 120.0
         return (
             {"SPEAKER_00": {"gender_hint": gender, "segment_count": 1,
                             "total_duration": round(dur, 2),
-                            "median_f0": round(f0_per_seg[0], 1)}},
+                            "median_f0": round(f0_per_seg[0], 1),
+                            "speaking_wps": round(wps, 2),
+                            "suggested_rate": 0,
+                            "suggested_pitch": int(max(-10, min(10, round((f0_per_seg[0] - f0_bl) / 10) * 2)))}},
             spk_segs,
         )
 
     X = StandardScaler().fit_transform(np.array(features))
-    # Heuristic: 1 speaker per ~8 segments, capped at 4
-    n_clusters = min(max(2, len(features) // 8), 4, len(features))
-    labels = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward").fit_predict(X)
+    # Auto-detect optimal speaker count via silhouette scoring — no hard cap
+    from sklearn.metrics import silhouette_score as _sil
+    n = len(features)
+    max_k = max(2, min(12, n // 3 + 1))
+    if n > 2:
+        max_k = min(max_k, n - 1)
+    best_k, best_score = 2, -1.0
+    for k in range(2, max_k + 1):
+        lbl = AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(X)
+        sc = _sil(X, lbl) if k < n else 0.0
+        if sc > best_score:
+            best_k, best_score = k, sc
+    labels = AgglomerativeClustering(n_clusters=best_k, linkage="ward").fit_predict(X)
     return _build_speaker_dicts(segs, labels, f0_per_seg)
 
 
@@ -274,17 +310,28 @@ def _build_speaker_dicts(segs: list, labels, f0_per_seg: list) -> tuple:
         raw[spk]["idxs"].append(i)
         raw[spk]["f0"].append(f0_per_seg[i])
 
+    _BASELINE_WPS = 2.5  # typical speaking rate (words per second)
     speakers: dict = {}
     spk_segs_list = [()] * len(segs)
     for spk, data in sorted(raw.items()):
         med_f0 = float(np.median(data["f0"]))
         gender = "F" if med_f0 > 165 else "M"
         total_dur = sum(segs[i][1] - segs[i][0] for i in data["idxs"])
+        # Estimate speaking rate and derive TTS rate/pitch offsets
+        total_words = sum(len(segs[i][2].split()) for i in data["idxs"])
+        wps = total_words / total_dur if total_dur > 0 else _BASELINE_WPS
+        rate_frac = (wps - _BASELINE_WPS) / _BASELINE_WPS
+        suggested_rate = int(max(-20, min(20, round(rate_frac * 50 / 2) * 2)))
+        f0_baseline = 200.0 if gender == "F" else 120.0
+        suggested_pitch = int(max(-10, min(10, round((med_f0 - f0_baseline) / 10) * 2)))
         speakers[spk] = {
             "gender_hint": gender,
             "segment_count": len(data["idxs"]),
             "total_duration": round(total_dur, 2),
             "median_f0": round(med_f0, 1),
+            "speaking_wps": round(wps, 2),
+            "suggested_rate": suggested_rate,
+            "suggested_pitch": suggested_pitch,
         }
         for i in data["idxs"]:
             spk_segs_list[i] = (segs[i][0], segs[i][1], segs[i][2], spk)
@@ -294,11 +341,16 @@ def _build_speaker_dicts(segs: list, labels, f0_per_seg: list) -> tuple:
 
 # ── mux helper ────────────────────────────────────────────────────────────────
 
-def _mux_job(mux_id: str, video_path: str, audio_path: str, mode: str, out_ext: str):
+def _mux_job(mux_id: str, video_path: str, audio_path: str,
+             include_original: bool, include_dubbed: bool,
+             out_ext: str, audio_bitrate: str = "192k",
+             job_id: str = ""):
     """
-    Background thread: mux dubbed MP3 into the original video.
-    mode: 'replace' → remove original audio tracks, add dubbed
-          'add'     → keep original tracks, append dubbed as new track
+    Background thread: bundle video with selected audio tracks.
+    include_original – keep all original audio tracks from the source video
+    include_dubbed   – add the TTS-dubbed audio track
+    out_ext          – '.mp4' or '.mkv'
+    audio_bitrate    – AAC target bitrate, matched to source (e.g. '192k')
     """
     mux = _mux_jobs[mux_id]
     q = mux["queue"]
@@ -306,35 +358,38 @@ def _mux_job(mux_id: str, video_path: str, audio_path: str, mode: str, out_ext: 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{mux_id}{out_ext}")
     try:
-        _push(q, "progress", json.dumps({"msg": "Muxing audio into video…", "pct": 10}))
-        if mode == "replace":
-            cmd = [
-                FFMPEG, "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                out_path,
-            ]
-        else:  # add
-            cmd = [
-                FFMPEG, "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-map", "0:v:0",
-                "-map", "0:a?",     # keep original audio tracks (if any)
-                "-map", "1:a:0",    # append dubbed track
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                out_path,
-            ]
+        _push(q, "progress", json.dumps({"msg": "Bundling tracks…", "pct": 10}))
+        # Build ffmpeg inputs and stream maps
+        inputs = [FFMPEG, "-y", "-i", video_path]
+        maps = ["-map", "0:v:0"]
+        dubbed_idx = 1
+        if include_dubbed:
+            inputs += ["-i", audio_path]
+        if include_original:
+            maps += ["-map", "0:a?"]
+        if include_dubbed:
+            maps += ["-map", f"{dubbed_idx}:a:0"]
+        # Transcode to AAC when dubbed track is present; copy otherwise
+        if include_dubbed:
+            audio_args = ["-c:a", "aac", "-b:a", audio_bitrate]
+        else:
+            audio_args = ["-c:a", "copy"]
+        cmd = inputs + maps + ["-c:v", "copy"] + audio_args + [out_path]
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg mux error: {r.stderr.decode()}")
+            raise RuntimeError(f"ffmpeg error: {r.stderr.decode()}")
         mux["result_path"] = out_path
+        # Auto-save bundled video to configured output folder
+        _out_folder = _config.get("output_folder", "")
+        if _out_folder:
+            try:
+                import shutil as _shutil
+                os.makedirs(_out_folder, exist_ok=True)
+                _src_job = _jobs.get(job_id, {}) if job_id else {}
+                _base = Path(_src_job.get("original_filename", f"job_{mux_id[:8]}")).stem
+                _shutil.copy2(out_path, os.path.join(_out_folder, f"{_base}_bundled{out_ext}"))
+            except Exception as _e:
+                app.logger.warning("Auto-save bundled video failed: %s", _e)
         _push(q, "done", json.dumps({"msg": "Video ready!"}))
     except Exception as exc:
         mux["error"] = str(exc)
@@ -365,8 +420,21 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
         if r.returncode != 0:
             raise RuntimeError(f"ffmpeg error: {r.stderr.decode()}")
 
-        _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019\u2026", "pct": 20}))
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        # Detect source audio bitrate so the dubbed MP3 can match it
+        try:
+            _probe = _run_ffprobe(video_path)
+            for _s in _probe.get("streams", []):
+                if _s.get("codec_type") == "audio" and _s.get("bit_rate"):
+                    _kb = max(64, min(320, int(int(_s["bit_rate"]) / 1000)))
+                    job["source_audio_bitrate"] = f"{_kb}k"
+                    break
+            else:
+                job["source_audio_bitrate"] = "192k"
+        except Exception:
+            job["source_audio_bitrate"] = "192k"
+
+        _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019 on {_DEVICE_LABEL}\u2026", "pct": 20}))
+        model = WhisperModel(model_size, device=_DEVICE, compute_type=_COMPUTE_TYPE)
 
         lang = None if language == "auto" else language
         _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
@@ -387,7 +455,8 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             speaker_segs = [(s, e, t, "SPEAKER_00") for s, e, t in segs]
             speakers = {"SPEAKER_00": {"gender_hint": "U", "segment_count": len(segs),
                                        "total_duration": sum(e - s for s, e, t in segs),
-                                       "median_f0": 0.0}}
+                                       "median_f0": 0.0, "speaking_wps": 0.0,
+                                       "suggested_rate": 0, "suggested_pitch": 0}}
         job["speakers"] = speakers
         job["speaker_segs"] = speaker_segs
 
@@ -425,6 +494,20 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             "langs": langs_result,
             "segments": raw_segs_by_lang,  # timed (start, end, text) per lang — used by dubbing
         }
+        # Auto-save subtitle files to configured output folder
+        _out_folder = _config.get("output_folder", "")
+        if _out_folder:
+            try:
+                os.makedirs(_out_folder, exist_ok=True)
+                _base = Path(job.get("original_filename", f"job_{job_id[:8]}")).stem
+                for _lang, _ldata in langs_result.items():
+                    for _fmt, _ext in [("srt", "srt"), ("vtt", "vtt"), ("plain", "txt")]:
+                        _content = _ldata.get(_fmt, "")
+                        if _content:
+                            with open(os.path.join(_out_folder, f"{_base}_{_lang}.{_ext}"), "w", encoding="utf-8") as _f:
+                                _f.write(_content)
+            except Exception as _e:
+                app.logger.warning("Auto-save subtitles failed: %s", _e)
         _push(q, "done", json.dumps({"msg": "Done!"}))
     except Exception as exc:
         job["error"] = str(exc)
@@ -442,11 +525,25 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
 # ── dubbing helpers ────────────────────────────────────────────────────────────
 
 async def _tts_generate(text: str, voice: str, output_path: str,
-                        rate: str = "+0%", pitch: str = "+0Hz"):
-    """Generate one TTS segment and save as MP3 via edge-tts."""
+                        rate: str = "+0%", pitch: str = "+0Hz",
+                        retries: int = 3):
+    """Generate one TTS segment and save as MP3 via edge-tts.
+
+    Retries up to `retries` times on NoAudioReceived before re-raising.
+    """
+    import asyncio as _asyncio
     import edge_tts  # lazy import — only needed for dubbing
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await communicate.save(output_path)
+    last_exc: Exception = RuntimeError("TTS failed after retries")
+    for attempt in range(retries):
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            await communicate.save(output_path)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                await _asyncio.sleep(1.5 * (attempt + 1))
+    raise last_exc
 
 
 def _dub_job(dub_id: str, job_id: str, lang: str, voice_profiles=None):
@@ -478,9 +575,21 @@ def _dub_job(dub_id: str, job_id: str, lang: str, voice_profiles=None):
         _push(q, "progress", json.dumps({"msg": "Exporting MP3\u2026", "pct": 93}))
         out_dir = os.path.join(_LOCAL_CACHE, "audio")
         out_path = os.path.join(out_dir, f"{dub_id}_{lang}.mp3")
-        result_audio.export(out_path, format="mp3", bitrate="128k")
+        src_bitrate = _jobs.get(job_id, {}).get("source_audio_bitrate", "192k")
+        result_audio.export(out_path, format="mp3", bitrate=src_bitrate)
 
         dub["result_path"] = out_path
+        # Auto-save dubbed audio to configured output folder
+        _out_folder = _config.get("output_folder", "")
+        if _out_folder:
+            try:
+                import shutil as _shutil
+                os.makedirs(_out_folder, exist_ok=True)
+                _src_job = _jobs.get(job_id, {})
+                _base = Path(_src_job.get("original_filename", f"job_{job_id[:8]}")).stem
+                _shutil.copy2(out_path, os.path.join(_out_folder, f"{_base}_{lang}_dubbed.mp3"))
+            except Exception as _e:
+                app.logger.warning("Auto-save dubbed audio failed: %s", _e)
         _push(q, "done", json.dumps({"msg": "Dubbed audio ready!"}))
     except Exception as exc:
         dub["error"] = str(exc)
@@ -557,8 +666,12 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
                 loop.run_until_complete(_tts_generate(text, voice, tts_path, rate, pitch))
             finally:
                 loop.close()
-            tts_seg = AudioSegment.from_mp3(tts_path)
-            result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
+            if os.path.exists(tts_path) and os.path.getsize(tts_path) > 0:
+                tts_seg = AudioSegment.from_mp3(tts_path)
+                result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
+        except Exception as tts_exc:
+            # Log and skip the segment rather than aborting the whole dub
+            app.logger.warning("TTS failed for segment %d (voice=%s): %s", i, voice, tts_exc)
         finally:
             if os.path.exists(tts_path):
                 os.unlink(tts_path)
@@ -605,7 +718,8 @@ def transcribe():
     video_path = os.path.join(video_dir, f"{job_id}{ext}")
     f.save(video_path)
 
-    _jobs[job_id] = {"queue": queue.Queue(), "result": None, "error": None}
+    _jobs[job_id] = {"queue": queue.Queue(), "result": None, "error": None,
+                     "original_filename": f.filename}
     threading.Thread(
         target=_run_job,
         args=(job_id, video_path, model_size, language, translate_to),
@@ -712,6 +826,24 @@ def media_info(job_id: str):
         return jsonify(error=str(exc)), 500
 
 
+@app.route("/media_info_file", methods=["POST"])
+def media_info_file():
+    """Run ffprobe on an uploaded file via stdin — no temp file written."""
+    f = request.files.get("video")
+    if not f:
+        return jsonify(error="No file provided"), 400
+    data = f.read()
+    r = subprocess.run(
+        [FFPROBE, "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-show_format", "-i", "pipe:0"],
+        input=data,
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        return jsonify(error="ffprobe error: " + r.stderr.decode(errors="replace")), 500
+    return jsonify(json.loads(r.stdout.decode()))
+
+
 @app.route("/voices/<lang>", methods=["GET"])
 def list_voices(lang: str):
     """Return available edge-tts voices for the given language prefix (e.g. 'en', 'es')."""
@@ -745,18 +877,26 @@ def start_mux(job_id: str, dub_id: str):
     video_path = job.get("video_path")
     if not video_path or not os.path.exists(video_path):
         return jsonify(error="Original video not available for muxing"), 404
-    mode = "replace"
+    include_original = True
+    include_dubbed = True
+    output_format = "mp4"
     if request.is_json and request.json:
-        mode = request.json.get("mode", "replace")
-    if mode not in ("replace", "add"):
-        return jsonify(error="mode must be 'replace' or 'add'"), 400
+        include_original = bool(request.json.get("include_original", True))
+        include_dubbed = bool(request.json.get("include_dubbed", True))
+        output_format = request.json.get("output_format", "mp4")
+    if output_format not in ("mp4", "mkv"):
+        output_format = "mp4"
+    if not include_original and not include_dubbed:
+        return jsonify(error="At least one audio track must be selected"), 400
 
-    out_ext = Path(video_path).suffix or ".mp4"
+    out_ext = "." + output_format
+    audio_bitrate = job.get("source_audio_bitrate", "192k")
     mux_id = str(uuid.uuid4())
     _mux_jobs[mux_id] = {"queue": queue.Queue(), "result_path": None, "error": None}
     threading.Thread(
         target=_mux_job,
-        args=(mux_id, video_path, dub["result_path"], mode, out_ext),
+        args=(mux_id, video_path, dub["result_path"],
+              include_original, include_dubbed, out_ext, audio_bitrate, job_id),
         daemon=True,
     ).start()
     return jsonify(mux_id=mux_id)
@@ -789,11 +929,12 @@ def download_muxed(mux_id: str):
     if not mux.get("result_path") or not os.path.exists(mux["result_path"]):
         return jsonify(error="Not ready"), 202
     ext = Path(mux["result_path"]).suffix
+    mime = "video/x-matroska" if ext.lower() == ".mkv" else "video/mp4"
     return send_file(
         mux["result_path"],
         as_attachment=True,
         download_name=f"dubbed_video{ext}",
-        mimetype="video/mp4",
+        mimetype=mime,
     )
 
 
@@ -827,6 +968,37 @@ def download_dub(dub_id: str):
     return send_file(path, as_attachment=True, download_name="dubbed_audio.mp3")
 
 
+@app.route("/config", methods=["GET"])
+def get_config():
+    return jsonify({"output_folder": _config.get("output_folder", "")})
+
+
+@app.route("/system-info", methods=["GET"])
+def system_info():
+    return jsonify({"device": _DEVICE, "compute_type": _COMPUTE_TYPE, "label": _DEVICE_LABEL})
+
+
+@app.route("/config", methods=["POST"])
+def set_config():
+    if not request.is_json:
+        return jsonify(error="JSON required"), 400
+    folder = (request.json.get("output_folder") or "").strip()
+    if folder and not os.path.isabs(folder):
+        return jsonify(error="Please provide an absolute path"), 400
+    if folder:
+        try:
+            os.makedirs(folder, exist_ok=True)
+            _test = os.path.join(folder, ".write_test")
+            with open(_test, "w") as _f:
+                _f.write("ok")
+            os.unlink(_test)
+        except OSError as exc:
+            return jsonify(error=f"Cannot write to folder: {exc}"), 400
+    _config["output_folder"] = folder
+    msg = f"Saving to: {folder}" if folder else "Auto-save disabled"
+    return jsonify(message=msg)
+
+
 # ── HTML template ──────────────────────────────────────────────────────────────
 
 HTML_UI = r"""<!DOCTYPE html>
@@ -837,11 +1009,11 @@ HTML_UI = r"""<!DOCTYPE html>
 <title>Video Subtitler</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;overflow-x:hidden}
 header{background:#1e293b;padding:1.25rem 2rem;border-bottom:1px solid #334155;display:flex;align-items:center;gap:.75rem}
 header h1{font-size:1.35rem;font-weight:700}
 .badge{background:#6366f1;color:#fff;font-size:.7rem;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.05em}
-main{max-width:960px;margin:2rem auto;padding:0 1rem}
+main{flex:1;min-width:0}
 .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:1.5rem;margin-bottom:1.5rem}
 .card h2{font-size:1rem;font-weight:600;margin-bottom:1rem;color:#94a3b8}
 .drop-zone{border:2px dashed #475569;border-radius:8px;padding:3rem 1rem;text-align:center;cursor:pointer;transition:border-color .2s,background .2s}
@@ -909,6 +1081,26 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
 .mux-box h4{margin:0 0 .5rem;font-size:.82rem;color:#34d399}
 .mux-radio{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem}
 .mux-radio label{display:flex;align-items:center;gap:.35rem;font-size:.8rem;color:#94a3b8;cursor:pointer}
+/* Layout with sidebar */
+.app-layout{display:flex;align-items:flex-start;gap:0;max-width:1280px;margin:2rem auto;padding:0 1rem}
+.app-main{flex:1;min-width:0}
+/* Log sidebar */
+.log-sidebar{width:280px;flex-shrink:0;position:sticky;top:1rem;margin-left:1rem;transition:width .25s}
+.log-sidebar.collapsed{width:32px}
+.log-toggle{background:#1e293b;border:1px solid #334155;border-radius:8px 8px 0 0;padding:.4rem .6rem;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.log-toggle span{font-size:.75rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
+.log-toggle svg{flex-shrink:0;transition:transform .25s}
+.log-sidebar.collapsed .log-toggle svg{transform:rotate(180deg)}
+.log-sidebar.collapsed .log-toggle span{display:none}
+.log-body{background:#0a0f1a;border:1px solid #334155;border-top:none;border-radius:0 0 8px 8px;height:calc(100vh - 120px);overflow-y:auto;display:flex;flex-direction:column;padding:.5rem}
+.log-sidebar.collapsed .log-body{display:none}
+.log-entry{font-size:.72rem;font-family:monospace;line-height:1.5;padding:.1rem 0;border-bottom:1px solid #1e293b;word-break:break-word}
+.log-entry.info{color:#94a3b8}
+.log-entry.ok{color:#4ade80}
+.log-entry.err{color:#f87171}
+.log-entry.prog{color:#818cf8}
+.log-clear{background:none;border:none;font-size:.65rem;color:#475569;cursor:pointer;align-self:flex-end;margin-bottom:.25rem;flex-shrink:0}
+.log-clear:hover{color:#94a3b8}
 </style>
 </head>
 <body>
@@ -919,12 +1111,31 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
   </svg>
   <h1>Video Subtitler</h1>
   <span class="badge">local</span>
+  <span id="device-badge" class="badge" style="background:#1e3a5f;color:#7dd3fc;display:none"></span>
 </header>
 
-<main>
+<div class="app-layout">
+<main class="app-main">
+  <!-- Output Settings -->
+  <div class="card">
+    <h2>&#9881; Output Settings <span style="font-weight:400;color:#475569;font-size:.82rem">(optional)</span></h2>
+    <div class="row" style="align-items:flex-end;gap:.75rem">
+      <div class="field" style="flex:2;min-width:200px">
+        <label for="output-folder">Auto-save subtitles &amp; audio to folder</label>
+        <input type="text" id="output-folder" placeholder="/absolute/path/to/output  (leave blank to download manually)"
+               style="background:#0f172a;border:1px solid #475569;color:#e2e8f0;border-radius:6px;padding:.5rem .75rem;font-size:.88rem;width:100%"/>
+      </div>
+      <button class="btn" id="set-folder-btn" style="padding:.5rem 1.1rem;font-size:.85rem;flex-shrink:0">Set</button>
+    </div>
+    <div id="folder-status" style="font-size:.76rem;margin-top:.35rem;color:#64748b"></div>
+  </div>
+
   <!-- Step 1 -->
   <div class="card">
-    <h2>1 — Upload video</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem">
+      <h2 style="margin:0">1 &mdash; Upload video</h2>
+      <button class="btn" id="media-info-btn" disabled style="background:#0c4a6e;border:1px solid #0369a1;color:#7dd3fc;padding:.35rem .9rem;font-size:.8rem">&#128249; Media Info</button>
+    </div>
     <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 4v12M8 8l4-4 4 4"/>
@@ -1003,17 +1214,14 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
 
   <!-- Step 6: Dub Audio -->
   <div class="card" id="dub-card" style="display:none">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem">
-      <h2 style="margin:0">6 &mdash; Dub Audio <span style="color:#94a3b8;font-weight:400">(AI voices per speaker)</span></h2>
-      <button class="btn" id="media-info-btn" style="background:#0f4c75;border-color:#0369a1;padding:.35rem .9rem;font-size:.8rem">&#128249; Media Info</button>
-    </div>
+    <h2 style="margin-bottom:.5rem">6 &mdash; Dub Audio <span style="color:#94a3b8;font-weight:400">(AI voices per speaker)</span></h2>
     <p class="dub-note" style="margin-top:.7rem">Background music is preserved (briefly ducked during dialogue). Each detected speaker gets its own neural voice. Fine-tune rate and pitch &plusmn;5% to match the original character. Internet required for voice synthesis.</p>
     <div class="row" style="align-items:flex-end;margin-top:.25rem">
       <div class="field">
         <label for="dub-lang-sel">Target language</label>
         <select id="dub-lang-sel"></select>
       </div>
-      <button class="btn" id="load-speakers-btn" style="background:#0f4c75;border-color:#0369a1">Load Speaker Profiles</button>
+      <button class="btn" id="load-speakers-btn" style="background:#0c4a6e;border:1px solid #0369a1;color:#7dd3fc">Load Speaker Profiles</button>
     </div>
     <div id="spk-section" style="display:none;margin-top:.75rem">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.25rem">
@@ -1037,10 +1245,22 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
         <button class="btn" id="mux-btn" style="background:#064e3b;border-color:#065f46;padding:.4rem 1rem;font-size:.82rem">&#127916; Mux into video</button>
       </div>
       <div class="mux-box" id="mux-box" style="display:none">
-        <h4>&#127916; Track Options</h4>
-        <div class="mux-radio">
-          <label><input type="radio" name="mux-mode" value="replace" checked> Replace original audio</label>
-          <label><input type="radio" name="mux-mode" value="add"> Add as additional track</label>
+        <h4>&#127916; Bundle Options</h4>
+        <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:.65rem">
+          <div>
+            <span style="font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:.3rem">Container</span>
+            <div class="mux-radio">
+              <label><input type="radio" name="mux-fmt" value="mp4" checked> MP4</label>
+              <label><input type="radio" name="mux-fmt" value="mkv"> MKV</label>
+            </div>
+          </div>
+          <div>
+            <span style="font-size:.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:.3rem">Audio tracks</span>
+            <div style="display:flex;flex-direction:column;gap:.3rem">
+              <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:#94a3b8;cursor:pointer"><input type="checkbox" id="mux-orig" checked> Keep original audio track(s)</label>
+              <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:#94a3b8;cursor:pointer"><input type="checkbox" id="mux-dubbed" checked> Include dubbed audio track</label>
+            </div>
+          </div>
         </div>
         <button class="btn" id="mux-go-btn">Build video</button>
         <div id="mux-prog-wrap" style="display:none;margin-top:.75rem">
@@ -1057,6 +1277,18 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
   </div>
 </main>
 
+<!-- Log sidebar -->
+<aside class="log-sidebar" id="log-sidebar">
+  <div class="log-toggle" id="log-toggle">
+    <span>&#128221; Activity Log</span>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+  </div>
+  <div class="log-body" id="log-body">
+    <button class="log-clear" id="log-clear">clear</button>
+  </div>
+</aside>
+</div>
+
 <!-- Media Info Modal -->
 <div class="modal-overlay" id="media-modal">
   <div class="modal">
@@ -1067,6 +1299,85 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
     <div style="margin-top:1rem;font-size:.75rem;color:#475569">Stream details from ffprobe</div>
   </div>
 </div>
+<script>
+// ── Activity Log ─────────────────────────────────────────────────────────────
+const logSidebar = document.getElementById("log-sidebar");
+const logBody    = document.getElementById("log-body");
+const logToggle  = document.getElementById("log-toggle");
+const logClear   = document.getElementById("log-clear");
+
+logToggle.addEventListener("click", () => logSidebar.classList.toggle("collapsed"));
+logClear.addEventListener("click", () => {
+  [...logBody.querySelectorAll(".log-entry")].forEach(el => el.remove());
+});
+
+function log(msg, type = "info") {
+  const now = new Date();
+  const ts  = now.toTimeString().slice(0,8);
+  const el  = document.createElement("div");
+  el.className = "log-entry " + type;
+  el.textContent = "[" + ts + "] " + msg;
+  logBody.appendChild(el);
+  logBody.scrollTop = logBody.scrollHeight;
+}
+
+// ── Output folder config ──────────────────────────────────────────────
+const outputFolderInput = document.getElementById("output-folder");
+const setFolderBtn      = document.getElementById("set-folder-btn");
+const folderStatus      = document.getElementById("folder-status");
+
+(async () => {
+  try {
+    const r = await fetch("/config");
+    if (r.ok) {
+      const j = await r.json();
+      if (j.output_folder) {
+        outputFolderInput.value = j.output_folder;
+        folderStatus.textContent = "Active: " + j.output_folder;
+        folderStatus.style.color = "#4ade80";
+      }
+    }
+  } catch (_) {}
+  try {
+    const sr = await fetch("/system-info");
+    if (sr.ok) {
+      const si = await sr.json();
+      const badge = document.getElementById("device-badge");
+      badge.textContent = si.label;
+      badge.style.background = si.device === "cuda" ? "#14532d" : "#1e3a5f";
+      badge.style.color      = si.device === "cuda" ? "#86efac" : "#7dd3fc";
+      badge.style.display    = "";
+    }
+  } catch (_) {}
+})();
+
+setFolderBtn.addEventListener("click", async () => {
+  const folder = outputFolderInput.value.trim();
+  let resp;
+  try {
+    resp = await fetch("/config", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({output_folder: folder}),
+    });
+  } catch (e) {
+    folderStatus.textContent = "Error: " + e.message;
+    folderStatus.style.color = "#f87171";
+    return;
+  }
+  const j = await resp.json();
+  if (resp.ok) {
+    folderStatus.textContent = j.message;
+    folderStatus.style.color = "#4ade80";
+    log("Output folder: " + (folder || "disabled"), "ok");
+  } else {
+    folderStatus.textContent = "Error: " + j.error;
+    folderStatus.style.color = "#f87171";
+    log("Folder error: " + j.error, "err");
+  }
+});
+
+// ── App state ─────────────────────────────────────────────────────────────────
 let selectedFile = null, currentLang = null, currentFmt = "plain";
 let resultData = null, jobId = null;
 
@@ -1088,6 +1399,8 @@ function setFile(f) {
   selectedFile = f;
   fileName.textContent = f ? f.name : "";
   runBtn.disabled = !f;
+  mediaInfoBtn.disabled = !f;
+  if (f) log("File selected: " + f.name + " (" + (f.size/1024/1024).toFixed(1) + " MB)");
 }
 
 fileInput.addEventListener("change", () => setFile(fileInput.files[0] || null));
@@ -1131,6 +1444,8 @@ runBtn.addEventListener("click", async () => {
 
   const data = await resp.json();
   jobId = data.job_id;
+  log("Upload complete — job " + jobId.slice(0,8));
+  log("Transcription started (model: " + document.getElementById("model-sel").value + ")");
   listenProgress(jobId);
 });
 
@@ -1140,18 +1455,23 @@ function listenProgress(jid) {
     const d = JSON.parse(e.data);
     progMsg.textContent = d.msg;
     progBar.style.width = (d.pct || 0) + "%";
+    log(d.msg, "prog");
   });
   es.addEventListener("done", async () => {
     es.close();
     progBar.style.width = "100%";
     progMsg.textContent = "Done!";
+    log("Transcription done", "ok");
     const r = await fetch("/result/" + jid);
     const data = await r.json();
     showResults(jid, data);
   });
   es.addEventListener("error", e => {
     es.close();
-    try { showError(JSON.parse(e.data).msg); } catch(_) { showError("Transcription failed."); }
+    let msg;
+    try { msg = JSON.parse(e.data).msg; } catch(_) { msg = "Transcription failed."; }
+    showError(msg);
+    log("Transcription error: " + msg, "err");
   });
 }
 
@@ -1193,6 +1513,7 @@ function showResults(jid, data) {
   initDubCard(data);
   resultsCard.style.display = "block";
   runBtn.disabled = false;
+  log("Results: " + data.segment_count + " segs, lang=" + (data.detected_language_name || data.detected_language) + ", " + Object.keys(data.langs).length + " version(s)", "ok");
 }
 
 function renderText() {
@@ -1280,12 +1601,19 @@ mediaInfoBtn.addEventListener("click", openMediaModal);
 mediaModal.addEventListener("click", e => { if (e.target === mediaModal) closeMediaModal(); });
 
 async function openMediaModal() {
-  if (!jobId) return;
+  if (!selectedFile && !jobId) return;
   mediaFormatInfo.textContent = "Loading\u2026";
   mediaStreams.innerHTML = "";
   mediaModal.classList.add("open");
   try {
-    const resp = await fetch("/media_info/" + jobId);
+    let resp;
+    if (jobId) {
+      resp = await fetch("/media_info/" + jobId);
+    } else {
+      const fd = new FormData();
+      fd.append("video", selectedFile);
+      resp = await fetch("/media_info_file", { method: "POST", body: fd });
+    }
     if (!resp.ok) throw new Error("Media info unavailable");
     const info = await resp.json();
     renderMediaInfo(info);
@@ -1334,7 +1662,7 @@ loadSpeakersBtn.addEventListener("click", async () => {
   spkSection.style.display = "block";
   spkLoading.textContent = "Loading\u2026";
   spkGrid.innerHTML = "";
-
+  log("Loading speaker profiles for lang=" + lang);
   try {
     const [spkResp, voiceResp] = await Promise.all([
       fetch("/speakers/" + jobId),
@@ -1343,15 +1671,27 @@ loadSpeakersBtn.addEventListener("click", async () => {
     const spkData = await spkResp.json();
     const voices  = voiceResp.ok ? await voiceResp.json() : [];
     const spks    = spkData.speakers || {};
-    spkLoading.textContent = Object.keys(spks).length
-      ? Object.keys(spks).length + " speaker(s) detected"
+    const nSpk    = Object.keys(spks).length;
+    spkLoading.textContent = nSpk
+      ? nSpk + " speaker(s) detected"
       : "Single-speaker mode";
-    renderSpeakerCards(spks, voices);
-  } catch (e) { spkLoading.textContent = "Could not load profiles: " + e.message; }
+    renderSpeakerCards(spks, voices, resultData ? resultData.detected_language : null);
+    log((nSpk || 1) + " speaker(s) loaded, " + voices.length + " voice(s) available", "ok");
+  } catch (e) {
+    spkLoading.textContent = "Could not load profiles: " + e.message;
+    log("Speaker load error: " + e.message, "err");
+  }
 });
 
-function renderSpeakerCards(speakers, voices) {
+function renderSpeakerCards(speakers, voices, srcLang) {
   spkGrid.innerHTML = "";
+  if (srcLang) {
+    const _noteEl = document.createElement("p");
+    _noteEl.style.cssText = "width:100%;font-size:.75rem;color:#475569;margin:.1rem 0 .5rem";
+    const _lnNames = {en:"English",es:"Spanish",fr:"French",de:"German",it:"Italian",pt:"Portuguese",nl:"Dutch",pl:"Polish",ru:"Russian",ja:"Japanese",ko:"Korean",zh:"Chinese",ar:"Arabic",tr:"Turkish",sv:"Swedish",da:"Danish",fi:"Finnish",no:"Norwegian",he:"Hebrew"};
+    _noteEl.innerHTML = "Source language: <strong style='color:#94a3b8'>" + (_lnNames[srcLang] || srcLang) + "</strong> \u2014 speed &amp; pitch are pre-set from acoustic analysis. Choose a voice accent to match.";
+    spkGrid.appendChild(_noteEl);
+  }
   let keys = Object.keys(speakers).sort();
   if (!keys.length) {
     keys = ["SPEAKER_00"];
@@ -1373,12 +1713,18 @@ function renderSpeakerCards(speakers, voices) {
 
     const meta = info.segment_count
       ? " \u2014 " + info.segment_count + " segs \u00b7 " + info.total_duration + "s" +
-        (info.median_f0 ? " \u00b7 F0: " + info.median_f0 + " Hz" : "")
+        (info.median_f0 ? " \u00b7 F0: " + info.median_f0 + " Hz" : "") +
+        (info.speaking_wps ? " \u00b7 " + info.speaking_wps + " wps" : "")
       : "";
 
     const mkOpts = arr => arr.map(v =>
       "<option value='" + v.shortName + "'>" + v.friendlyName + " (" + v.gender[0] + ")</option>"
     ).join("");
+
+    const sugRate  = typeof info.suggested_rate  === "number" ? info.suggested_rate  : 0;
+    const sugPitch = typeof info.suggested_pitch === "number" ? info.suggested_pitch : 0;
+    const rateDisp  = (sugRate  >= 0 ? "+" : "") + sugRate  + "%";
+    const pitchDisp = (sugPitch >= 0 ? "+" : "") + sugPitch + "Hz";
 
     card.innerHTML =
       "<h4>" + spk.replace("SPEAKER_","Speaker ") +
@@ -1389,10 +1735,10 @@ function renderSpeakerCards(speakers, voices) {
       "</div>" +
       "<label>Voice</label>" +
       "<select class='voice-sel'>" + mkOpts(voiceList) + "</select>" +
-      "<label>Speed <span class='slider-val' id='rate-val-" + spk + "'>+0%</span></label>" +
-      "<div class='slider-row'><input type='range' min='-5' max='5' step='1' value='0' class='rate-sl' id='rate-" + spk + "'></div>" +
-      "<label>Pitch <span class='slider-val' id='pitch-val-" + spk + "'>+0Hz</span></label>" +
-      "<div class='slider-row'><input type='range' min='-5' max='5' step='1' value='0' class='pitch-sl' id='pitch-" + spk + "'></div>";
+      "<label>Speed <span class='slider-val' id='rate-val-" + spk + "'>" + rateDisp + "</span></label>" +
+      "<div class='slider-row'><input type='range' min='-20' max='20' step='2' value='" + sugRate + "' class='rate-sl' id='rate-" + spk + "'></div>" +
+      "<label>Pitch <span class='slider-val' id='pitch-val-" + spk + "'>" + pitchDisp + "</span></label>" +
+      "<div class='slider-row'><input type='range' min='-10' max='10' step='2' value='" + sugPitch + "' class='pitch-sl' id='pitch-" + spk + "'></div>";
 
     spkGrid.appendChild(card);
 
@@ -1445,6 +1791,7 @@ dubBtn.addEventListener("click", async () => {
   dubBtn.disabled = true;
 
   const voiceProfiles = collectVoiceProfiles();
+  log("Starting dub — lang=" + lang + ", " + Object.keys(voiceProfiles).length + " speaker profile(s)");
 
   let resp;
   try {
@@ -1467,6 +1814,7 @@ dubBtn.addEventListener("click", async () => {
     const d = JSON.parse(e.data);
     dubProgMsg.textContent  = d.msg;
     dubProgBar.style.width  = (d.pct || 0) + "%";
+    log(d.msg, "prog");
   });
   es.addEventListener("done", () => {
     es.close();
@@ -1477,10 +1825,13 @@ dubBtn.addEventListener("click", async () => {
     dubDlBtn.href        = "/download_dub/" + dub_id;
     dubResultArea.style.display = "block";
     dubBtn.disabled = false;
+    log("Dub complete — " + (dubLangNames[lang] || lang), "ok");
   });
   es.addEventListener("error", e => {
     es.close();
-    try { showDubError(JSON.parse(e.data).msg); } catch(_) { showDubError("Dubbing failed."); }
+    let msg; try { msg = JSON.parse(e.data).msg; } catch(_) { msg = "Dubbing failed."; }
+    showDubError(msg);
+    log("Dub error: " + msg, "err");
   });
 });
 
@@ -1498,25 +1849,32 @@ muxBtn.addEventListener("click", () => {
 
 muxGoBtn.addEventListener("click", async () => {
   if (!jobId || !currentDubId) return;
-  const mode = document.querySelector("input[name='mux-mode']:checked").value;
+  const includeOriginal = document.getElementById("mux-orig").checked;
+  const includeDubbed   = document.getElementById("mux-dubbed").checked;
+  const outputFmt       = document.querySelector("input[name='mux-fmt']:checked").value;
+  if (!includeOriginal && !includeDubbed) {
+    showMuxError("Select at least one audio track.");
+    return;
+  }
   muxProgWrap.style.display   = "block";
   muxProgBar.style.width      = "0%";
   muxProgMsg.textContent      = "Starting\u2026";
   muxErrorBox.style.display   = "none";
   muxResultArea.style.display = "none";
   muxGoBtn.disabled = true;
+  log("Bundle: " + outputFmt.toUpperCase() + (includeOriginal ? " +orig" : "") + (includeDubbed ? " +dub" : ""));
 
   let resp;
   try {
     resp = await fetch("/mux/" + jobId + "/" + currentDubId, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({mode}),
+      body: JSON.stringify({include_original: includeOriginal, include_dubbed: includeDubbed, output_format: outputFmt}),
     });
   } catch (e) { showMuxError("Request failed: " + e.message); return; }
   if (!resp.ok) {
     const j = await resp.json().catch(() => ({}));
-    showMuxError(j.error || "Failed to start mux");
+    showMuxError(j.error || "Failed to start bundle");
     return;
   }
   const { mux_id } = await resp.json();
@@ -1526,18 +1884,23 @@ muxGoBtn.addEventListener("click", async () => {
     const d = JSON.parse(e.data);
     muxProgMsg.textContent = d.msg;
     muxProgBar.style.width = (d.pct || 50) + "%";
+    log(d.msg, "prog");
   });
   es.addEventListener("done", () => {
     es.close();
     muxProgBar.style.width      = "100%";
     muxProgMsg.textContent      = "Done!";
     muxDlBtn.href               = "/download_muxed/" + mux_id;
+    muxDlBtn.textContent        = "\u2b07 Download " + outputFmt.toUpperCase() + " video";
     muxResultArea.style.display = "block";
     muxGoBtn.disabled = false;
+    log("Bundle complete \u2014 " + outputFmt.toUpperCase(), "ok");
   });
   es.addEventListener("error", e => {
     es.close();
-    try { showMuxError(JSON.parse(e.data).msg); } catch(_) { showMuxError("Mux failed."); }
+    let msg; try { msg = JSON.parse(e.data).msg; } catch(_) { msg = "Bundle failed."; }
+    showMuxError(msg);
+    log("Bundle error: " + msg, "err");
   });
 });
 
