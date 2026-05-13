@@ -562,6 +562,9 @@ def _dub_job(dub_id: str, job_id: str, lang: str, voice_profiles=None):
 
         _push(q, "progress", json.dumps({"msg": "Loading audio\u2026", "pct": 5}))
         from pydub import AudioSegment  # lazy import — only needed for dubbing
+        # Tell pydub where our ffmpeg binary is (critical on Windows when ffmpeg
+        # is bundled and not on the system PATH).
+        AudioSegment.converter = FFMPEG
 
         orig_audio = AudioSegment.from_wav(audio_path)
 
@@ -640,6 +643,7 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
                  voice_profiles: dict, default_voice: str, q):
     """Generate per-segment TTS and overlay onto base_audio. Returns new AudioSegment."""
     from pydub import AudioSegment  # already imported in caller, safe to re-import
+    AudioSegment.converter = FFMPEG
     result_audio = base_audio
     total = len(raw_segs)
     _push(q, "progress", json.dumps({"msg": f"Generating TTS (0/{total})\u2026", "pct": 15}))
@@ -982,13 +986,21 @@ def system_info():
 def browse_folder():
     """Open a native OS folder-picker dialog and return the selected path.
     Uses a subprocess so tkinter always runs on a fresh main thread.
+    Returns {"path": ""} gracefully when a display / tkinter is unavailable
+    (headless Linux servers, CI, etc.).
     """
     script = (
-        "import tkinter as tk; from tkinter import filedialog; "
-        "root = tk.Tk(); root.withdraw(); "
-        "root.wm_attributes('-topmost', True); "
-        "path = filedialog.askdirectory(title='Select output folder'); "
-        "print(path, end='')"
+        "import sys; "
+        "try:\n"
+        "    import tkinter as tk\n"
+        "    from tkinter import filedialog\n"
+        "    root = tk.Tk(); root.withdraw()\n"
+        "    try: root.wm_attributes('-topmost', True)\n"
+        "    except Exception: pass\n"
+        "    path = filedialog.askdirectory(title='Select output folder')\n"
+        "    print(path, end='')\n"
+        "except Exception as e:\n"
+        "    print('__error__:' + str(e), end='', file=sys.stderr)"
     )
     try:
         result = subprocess.run(
@@ -996,6 +1008,9 @@ def browse_folder():
             capture_output=True, text=True, timeout=120,
         )
         path = result.stdout.strip()
+        if not path and result.stderr.startswith("__error__:"):
+            msg = result.stderr[len("__error__:"):]
+            return jsonify({"path": "", "error": msg})
         return jsonify({"path": path})
     except subprocess.TimeoutExpired:
         return jsonify({"path": "", "error": "Dialog timed out"})
@@ -1966,5 +1981,9 @@ function showMuxError(msg) {
 """
 
 if __name__ == "__main__":
-    webbrowser.open("http://127.0.0.1:5001")
-    app.run(host="127.0.0.1", port=5001, threaded=True, debug=False)
+    _port = int(os.environ.get("PORT", 5001))
+    _url  = f"http://127.0.0.1:{_port}"
+    # Open the browser slightly after the server starts so the socket is ready.
+    # On Linux headless servers webbrowser.open may silently do nothing, which is fine.
+    threading.Timer(1.2, lambda: webbrowser.open(_url)).start()
+    app.run(host="127.0.0.1", port=_port, threaded=True, debug=False)
