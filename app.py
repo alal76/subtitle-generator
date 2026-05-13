@@ -119,6 +119,30 @@ _mux_jobs: dict = {}
 _config: dict = {"output_folder": ""}
 _pkg_index_fetched = False
 _pkg_index_lock = threading.Lock()
+_jobs_lock     = threading.Lock()  # guards _jobs / _dub_jobs / _mux_jobs
+_whisper_cache: dict = {}          # model_size -> WhisperModel instance
+_whisper_lock  = threading.Lock()
+
+# Response-literal constants (suppress duplicate-string warnings)
+_ERR_UNKNOWN_JOB = "Unknown job"
+_ERR_NOT_FOUND = "Not found"
+_MIME_SSE = "text/event-stream"
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+# Tunable constants (kept here so they are easy to find / change)
+_SAMPLE_RATE      = 16000   # Whisper-native sample rate
+_N_MFCC           = 20      # MFCC coefficients per segment
+_MAX_SPEAKERS     = 12      # cap for silhouette-scored speaker detection
+_GENDER_F0_HZ     = 165     # F0 threshold dividing male / female voices
+_F0_BASELINE_F    = 200.0   # baseline female F0 for pitch suggestions
+_F0_BASELINE_M    = 120.0   # baseline male F0 for pitch suggestions
+_BASELINE_WPS     = 2.5     # words-per-second baseline for rate suggestion
+_DUCK_DB          = -20     # ducking amount applied to original speech (dB)
+_DEFAULT_BITRATE  = "192k"  # fallback audio bitrate when probe fails
+_MIN_BITRATE_KB   = 64
+_MAX_BITRATE_KB   = 320
+_RATE_CLAMP       = 20      # max ±% applied to suggested_rate
+_PITCH_CLAMP      = 10      # max ±Hz applied to suggested_pitch
 
 # ── device detection (runs once at startup) ───────────────────────────────────
 def _detect_device() -> tuple[str, str]:
@@ -166,6 +190,21 @@ _ERR_UNKNOWN_JOB = "Unknown job"
 _ERR_NOT_FOUND = "Not found"
 _MIME_SSE = "text/event-stream"
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _error(msg: str, code: int = 400):
+    """Standard JSON error response."""
+    return jsonify(error=msg), code
+
+
+def _get_whisper_model(model_size: str):
+    """Return a cached WhisperModel for this size, building it lazily."""
+    with _whisper_lock:
+        if model_size not in _whisper_cache:
+            _whisper_cache[model_size] = WhisperModel(
+                model_size, device=_DEVICE, compute_type=_COMPUTE_TYPE,
+            )
+        return _whisper_cache[model_size]
 
 
 # ── subtitle builders ─────────────────────────────────────────────────────────
@@ -246,7 +285,7 @@ def _run_ffprobe(file_path: str) -> dict:
     return json.loads(r.stdout.decode())
 
 
-def _transcribe(audio_path: str, model_size: str, language):
+def _transcribe(audio_path: str, model_size: str, language) -> tuple[list, str]:
     """Run Whisper on `audio_path` using the best available backend.
 
     Returns (segs, detected_lang) where segs = [(start, end, text), ...]
@@ -255,18 +294,20 @@ def _transcribe(audio_path: str, model_size: str, language):
     if _DEVICE == "mlx":
         # Apple Silicon GPU / Neural Engine path
         import mlx_whisper  # type: ignore[import-not-found]
+        from typing import Any, cast
         repo = _MLX_REPO.get(model_size, _MLX_REPO["small"])
-        result = mlx_whisper.transcribe(
+        result: dict = cast(Any, mlx_whisper.transcribe(
             audio_path,
             path_or_hf_repo=repo,
             language=language,
             word_timestamps=False,
-        )
+        ))
         segs = [(float(s["start"]), float(s["end"]), s["text"].strip())
                 for s in result.get("segments", [])]
-        return segs, result.get("language") or (language or "en")
+        detected_lang = result.get("language") or (language or "en")
+        return segs, str(detected_lang)
     # Default: faster-whisper (CPU int8 or CUDA float16)
-    model = WhisperModel(model_size, device=_DEVICE, compute_type=_COMPUTE_TYPE)
+    model = _get_whisper_model(model_size)
     segs_gen, info = model.transcribe(audio_path, language=language, beam_size=5)
     segs = [(s.start, s.end, s.text.strip()) for s in segs_gen]
     return segs, info.language
@@ -274,77 +315,100 @@ def _transcribe(audio_path: str, model_size: str, language):
 
 # ── speaker diarization ───────────────────────────────────────────────────────
 
-def _diarize(audio_path: str, segs: list) -> tuple:
-    """
-    Cluster Whisper segments into speaker identities using MFCC features.
+def _single_speaker_fallback(segs: list) -> tuple:
+    """Return a single-speaker result when ML libs are unavailable."""
+    spk_segs = [(s, e, t, "SPEAKER_00") for s, e, t in segs]
+    total_dur = sum(e - s for s, e, t in segs)
+    return (
+        {"SPEAKER_00": {"gender_hint": "U", "segment_count": len(segs),
+                        "total_duration": round(total_dur, 2), "median_f0": 0.0,
+                        "speaking_wps": 0.0, "suggested_rate": 0, "suggested_pitch": 0}},
+        spk_segs,
+    )
 
-    Returns:
-        speakers  – {speaker_id: {gender_hint, segment_count, total_duration, median_f0}}
-        spk_segs  – [(start, end, text, speaker_id), …]
 
-    Falls back to single speaker (SPEAKER_00) if librosa/sklearn are unavailable.
-    """
-    try:
-        import librosa
-        import numpy as np
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.preprocessing import StandardScaler
-    except ImportError:
-        spk_segs = [(s, e, t, "SPEAKER_00") for s, e, t in segs]
-        total_dur = sum(e - s for s, e, t in segs)
-        return (
-            {"SPEAKER_00": {"gender_hint": "U", "segment_count": len(segs),
-                            "total_duration": round(total_dur, 2), "median_f0": 0.0,
-                            "speaking_wps": 0.0, "suggested_rate": 0, "suggested_pitch": 0}},
-            spk_segs,
-        )
+def _extract_mfcc_features(y, sr, segs: list) -> tuple:
+    """Return (features list, f0_per_seg list) for each segment of audio `y`."""
+    import librosa
+    import numpy as np
 
-    y, sr = librosa.load(audio_path, sr=16000, mono=True)
     features, f0_per_seg = [], []
-
     for start, end, _ in segs:
         s = int(start * sr)
         e = min(int(end * sr), len(y))
         chunk = y[s:e] if e > s else np.zeros(2048)
         if len(chunk) < 2048:
             chunk = np.pad(chunk, (0, 2048 - len(chunk)))
-        mfcc = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=20)
+        mfcc = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=_N_MFCC)
         features.append(np.mean(mfcc, axis=1))
         f0 = librosa.yin(chunk, fmin=60, fmax=500, sr=sr)
         valid = f0[f0 > 0]
         f0_per_seg.append(float(np.median(valid)) if len(valid) else 160.0)
+    return features, f0_per_seg
 
-    if len(features) < 2:
-        gender = "F" if f0_per_seg[0] > 165 else "M"
-        spk_segs = [(segs[0][0], segs[0][1], segs[0][2], "SPEAKER_00")]
-        dur = segs[0][1] - segs[0][0]
-        words = len(segs[0][2].split())
-        wps = words / dur if dur > 0 else 2.5
-        f0_bl = 200.0 if gender == "F" else 120.0
-        return (
-            {"SPEAKER_00": {"gender_hint": gender, "segment_count": 1,
-                            "total_duration": round(dur, 2),
-                            "median_f0": round(f0_per_seg[0], 1),
-                            "speaking_wps": round(wps, 2),
-                            "suggested_rate": 0,
-                            "suggested_pitch": int(max(-10, min(10, round((f0_per_seg[0] - f0_bl) / 10) * 2)))}},
-            spk_segs,
-        )
 
-    X = StandardScaler().fit_transform(np.array(features))
-    # Auto-detect optimal speaker count via silhouette scoring — no hard cap
+def _single_segment_speaker(segs: list, f0_per_seg: list) -> tuple:
+    """Build a single-speaker result derived from a single segment's F0."""
+    gender = "F" if f0_per_seg[0] > _GENDER_F0_HZ else "M"
+    spk_segs = [(segs[0][0], segs[0][1], segs[0][2], "SPEAKER_00")]
+    dur = segs[0][1] - segs[0][0]
+    words = len(segs[0][2].split())
+    wps = words / dur if dur > 0 else _BASELINE_WPS
+    f0_bl = _F0_BASELINE_F if gender == "F" else _F0_BASELINE_M
+    pitch = int(max(-_PITCH_CLAMP, min(_PITCH_CLAMP,
+                                       round((f0_per_seg[0] - f0_bl) / 10) * 2)))
+    return (
+        {"SPEAKER_00": {"gender_hint": gender, "segment_count": 1,
+                        "total_duration": round(dur, 2),
+                        "median_f0": round(f0_per_seg[0], 1),
+                        "speaking_wps": round(wps, 2),
+                        "suggested_rate": 0, "suggested_pitch": pitch}},
+        spk_segs,
+    )
+
+
+def _best_speaker_count(X, n: int) -> int:
+    """Silhouette-score the cluster range and return the best k (>=2)."""
+    from sklearn.cluster import AgglomerativeClustering
     from sklearn.metrics import silhouette_score as _sil
-    n = len(features)
-    max_k = max(2, min(12, n // 3 + 1))
+
+    max_k = max(2, min(_MAX_SPEAKERS, n // 3 + 1))
     if n > 2:
         max_k = min(max_k, n - 1)
     best_k, best_score = 2, -1.0
     for k in range(2, max_k + 1):
-        lbl = AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(X)
-        sc = _sil(X, lbl) if k < n else 0.0
+        # AgglomerativeClustering is deterministic; silhouette_score is
+        # deterministic without sample_size. SonarLint's random_state rule is
+        # a false positive here.
+        lbl = AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(X)  # NOSONAR
+        sc = _sil(X, lbl) if k < n else 0.0  # NOSONAR
         if sc > best_score:
             best_k, best_score = k, sc
-    labels = AgglomerativeClustering(n_clusters=best_k, linkage="ward").fit_predict(X)
+    return best_k
+
+
+def _diarize(audio_path: str, segs: list) -> tuple:
+    """Cluster Whisper segments into speaker identities using MFCC features."""
+    try:
+        import librosa
+        import numpy as np
+        from sklearn.cluster import AgglomerativeClustering
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return _single_speaker_fallback(segs)
+
+    y, sr = librosa.load(audio_path, sr=_SAMPLE_RATE, mono=True)
+    features, f0_per_seg = _extract_mfcc_features(y, sr, segs)
+
+    if len(features) < 2:
+        return _single_segment_speaker(segs, f0_per_seg)
+
+    X = StandardScaler().fit_transform(np.array(features))
+    best_k = _best_speaker_count(X, len(features))
+    # AgglomerativeClustering is deterministic; no random_state parameter exists.
+    labels = AgglomerativeClustering(  # NOSONAR
+        n_clusters=best_k, linkage="ward",
+    ).fit_predict(X)
     return _build_speaker_dicts(segs, labels, f0_per_seg)
 
 
@@ -453,6 +517,94 @@ def _push(q, event: str, data: str):
     q.put(f"event: {event}\ndata: {data}\n\n")
 
 
+def _extract_audio(video_path: str, audio_path: str):
+    """Extract 16 kHz mono WAV from source video. Raises RuntimeError on failure."""
+    r = subprocess.run(
+        [FFMPEG, "-y", "-i", video_path,
+         "-vn", "-acodec", "pcm_s16le", "-ar", str(_SAMPLE_RATE), "-ac", "1", audio_path],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        msg = r.stderr.decode(errors="replace")[:300]
+        raise RuntimeError(f"Failed to extract audio (codec/disk issue?): {msg}")
+
+
+def _detect_source_bitrate(video_path: str) -> str:
+    """Return a sensible '<kbps>k' string matched to the source audio stream."""
+    try:
+        probe = _run_ffprobe(video_path)
+        for s in probe.get("streams", []):
+            if s.get("codec_type") == "audio" and s.get("bit_rate"):
+                kb = max(_MIN_BITRATE_KB,
+                         min(_MAX_BITRATE_KB, int(int(s["bit_rate"]) / 1000)))
+                return f"{kb}k"
+    except Exception as e:
+        app.logger.warning("Bitrate probe failed: %s", e)
+    return _DEFAULT_BITRATE
+
+
+def _safe_diarize(audio_path: str, segs: list) -> tuple:
+    """Run diarization, falling back to single-speaker on any failure."""
+    try:
+        return _diarize(audio_path, segs)
+    except Exception as e:
+        app.logger.warning("Diarization failed, using single speaker: %s", e)
+        return _single_speaker_fallback(segs)
+
+
+def _translate_all(segs: list, detected: str, translate_to: list, q) -> tuple:
+    """Translate `segs` to each requested target language. Returns (raw_by_lang, langs_result)."""
+    raw_by_lang: dict = {detected: segs}
+    langs_result: dict = {
+        detected: {
+            "plain": "\n".join(t for _, _, t in segs),
+            "srt": _build_srt(segs),
+            "vtt": _build_vtt(segs),
+        }
+    }
+    targets = [t for t in translate_to if t != detected]
+    total = len(targets)
+    for done, tgt in enumerate(targets):
+        pct = 75 + int(20 * (done + 1) / max(total, 1))
+        name = LANG_NAME.get(tgt, tgt)
+        _push(q, "progress", json.dumps({"msg": f"Translating to {name}\u2026", "pct": pct}))
+        translated = _translate_segs(segs, detected, tgt)
+        raw_by_lang[tgt] = translated
+        langs_result[tgt] = {
+            "plain": "\n".join(t for _, _, t in translated),
+            "srt": _build_srt(translated),
+            "vtt": _build_vtt(translated),
+        }
+    return raw_by_lang, langs_result
+
+
+def _autosave_subtitles(out_folder: str, base_name: str, langs_result: dict):
+    """Write SRT/VTT/TXT for each language to the configured output folder."""
+    if not out_folder:
+        return
+    try:
+        os.makedirs(out_folder, exist_ok=True)
+        for lang, ldata in langs_result.items():
+            for fmt, ext in (("srt", "srt"), ("vtt", "vtt"), ("plain", "txt")):
+                content = ldata.get(fmt, "")
+                if content:
+                    path = os.path.join(out_folder, f"{base_name}_{lang}.{ext}")
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+    except Exception as e:
+        app.logger.warning("Auto-save subtitles failed: %s", e)
+
+
+def _cleanup_on_failure(*paths: str):
+    """Best-effort delete of temp files when a job fails."""
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.unlink(p)
+        except OSError as e:
+            app.logger.debug("Cleanup failed for %s: %s", p, e)
+
+
 def _run_job(job_id: str, video_path: str, model_size: str, language: str, translate_to: list):
     job = _jobs[job_id]
     q = job["queue"]
@@ -461,107 +613,45 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
     audio_path = os.path.join(audio_dir, f"{job_id}.wav")
     try:
         _push(q, "progress", json.dumps({"msg": "Extracting audio\u2026", "pct": 5}))
-        r = subprocess.run(
-            [FFMPEG, "-y", "-i", video_path,
-             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path],
-            capture_output=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg error: {r.stderr.decode()}")
+        _extract_audio(video_path, audio_path)
+        job["source_audio_bitrate"] = _detect_source_bitrate(video_path)
 
-        # Detect source audio bitrate so the dubbed MP3 can match it
-        try:
-            _probe = _run_ffprobe(video_path)
-            for _s in _probe.get("streams", []):
-                if _s.get("codec_type") == "audio" and _s.get("bit_rate"):
-                    _kb = max(64, min(320, int(int(_s["bit_rate"]) / 1000)))
-                    job["source_audio_bitrate"] = f"{_kb}k"
-                    break
-            else:
-                job["source_audio_bitrate"] = "192k"
-        except Exception:
-            job["source_audio_bitrate"] = "192k"
-
-        _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019 on {_DEVICE_LABEL}\u2026", "pct": 20}))
+        _push(q, "progress", json.dumps({
+            "msg": f"Loading Whisper \u2018{model_size}\u2019 on {_DEVICE_LABEL}\u2026",
+            "pct": 20,
+        }))
         lang = None if language == "auto" else language
         _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
         segs, detected = _transcribe(audio_path, model_size, lang)
 
         # Keep audio and video for dubbing / muxing features
         job["audio_path"] = audio_path
-        job["video_path"] = video_path  # persisted — not deleted on success
+        job["video_path"] = video_path
 
         _push(q, "progress", json.dumps({"msg": "Detecting speakers\u2026", "pct": 60}))
-        try:
-            speakers, speaker_segs = _diarize(audio_path, segs)
-        except Exception:
-            speaker_segs = [(s, e, t, "SPEAKER_00") for s, e, t in segs]
-            speakers = {"SPEAKER_00": {"gender_hint": "U", "segment_count": len(segs),
-                                       "total_duration": sum(e - s for s, e, t in segs),
-                                       "median_f0": 0.0, "speaking_wps": 0.0,
-                                       "suggested_rate": 0, "suggested_pitch": 0}}
+        speakers, speaker_segs = _safe_diarize(audio_path, segs)
         job["speakers"] = speakers
         job["speaker_segs"] = speaker_segs
 
-        _push(q, "progress", json.dumps({"msg": "Building original subtitles\u2026", "pct": 75}))
-        raw_segs_by_lang = {detected: segs}
-        langs_result = {
-            detected: {
-                "plain": "\n".join(t for _, _, t in segs),
-                "srt": _build_srt(segs),
-                "vtt": _build_vtt(segs),
-            }
-        }
-
-        total_trans = len([t for t in translate_to if t != detected])
-        done_trans = 0
-        for tgt in translate_to:
-            if tgt == detected:
-                continue
-            pct = 75 + int(20 * (done_trans + 1) / max(total_trans, 1))
-            name = LANG_NAME.get(tgt, tgt)
-            _push(q, "progress", json.dumps({"msg": f"Translating to {name}\u2026", "pct": pct}))
-            translated_segs = _translate_segs(segs, detected, tgt)
-            raw_segs_by_lang[tgt] = translated_segs
-            langs_result[tgt] = {
-                "plain": "\n".join(t for _, _, t in translated_segs),
-                "srt": _build_srt(translated_segs),
-                "vtt": _build_vtt(translated_segs),
-            }
-            done_trans += 1
+        _push(q, "progress", json.dumps({"msg": "Building subtitles\u2026", "pct": 75}))
+        raw_by_lang, langs_result = _translate_all(segs, detected, translate_to, q)
 
         job["result"] = {
             "detected_language": detected,
             "detected_language_name": LANG_NAME.get(detected, detected),
             "segment_count": len(segs),
             "langs": langs_result,
-            "segments": raw_segs_by_lang,  # timed (start, end, text) per lang — used by dubbing
+            "segments": raw_by_lang,
         }
-        # Auto-save subtitle files to configured output folder
-        _out_folder = _config.get("output_folder", "")
-        if _out_folder:
-            try:
-                os.makedirs(_out_folder, exist_ok=True)
-                _base = Path(job.get("original_filename", f"job_{job_id[:8]}")).stem
-                for _lang, _ldata in langs_result.items():
-                    for _fmt, _ext in [("srt", "srt"), ("vtt", "vtt"), ("plain", "txt")]:
-                        _content = _ldata.get(_fmt, "")
-                        if _content:
-                            with open(os.path.join(_out_folder, f"{_base}_{_lang}.{_ext}"), "w", encoding="utf-8") as _f:
-                                _f.write(_content)
-            except Exception as _e:
-                app.logger.warning("Auto-save subtitles failed: %s", _e)
+        base = Path(job.get("original_filename", f"job_{job_id[:8]}")).stem
+        _autosave_subtitles(_config.get("output_folder", ""), base, langs_result)
         _push(q, "done", json.dumps({"msg": "Done!"}))
     except Exception as exc:
         job["error"] = str(exc)
         _push(q, "error", json.dumps({"msg": str(exc)}))
-        # Clean up temp files on failure
-        if os.path.exists(audio_path):
-            os.unlink(audio_path)
-        if os.path.exists(video_path):
-            os.unlink(video_path)
+        _cleanup_on_failure(audio_path, video_path)
     finally:
-        # audio_path and video_path kept on success for dubbing/muxing
+        # audio_path and video_path are kept on success for dubbing/muxing
         q.put(None)
 
 
@@ -691,37 +781,41 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
     total = len(raw_segs)
     _push(q, "progress", json.dumps({"msg": f"Generating TTS (0/{total})\u2026", "pct": 15}))
 
-    for i, (start, _end, text) in enumerate(raw_segs):
-        pct = 15 + int(75 * (i + 1) / max(total, 1))
-        _push(q, "progress", json.dumps({
-            "msg": f"Generating speech {i + 1}/{total}\u2026", "pct": pct
-        }))
-        if not text.strip():
-            continue
+    # Reuse one event loop for all segments rather than spawning one per call.
+    loop = asyncio.new_event_loop()
+    try:
+        for i, (start, _end, text) in enumerate(raw_segs):
+            pct = 15 + int(75 * (i + 1) / max(total, 1))
+            _push(q, "progress", json.dumps({
+                "msg": f"Generating speech {i + 1}/{total}\u2026", "pct": pct
+            }))
+            if not text.strip():
+                continue
 
-        spk_id = seg_to_speaker.get(i, "SPEAKER_00")
-        profile = voice_profiles.get(spk_id, {})
-        voice = profile.get("voice") or default_voice
-        rate = profile.get("rate", "+0%")
-        pitch = profile.get("pitch", "+0Hz")
+            spk_id = seg_to_speaker.get(i, "SPEAKER_00")
+            profile = voice_profiles.get(spk_id, {})
+            voice = profile.get("voice") or default_voice
+            rate = profile.get("rate", "+0%")
+            pitch = profile.get("pitch", "+0Hz")
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
-            tts_path = tf.name
-        try:
-            loop = asyncio.new_event_loop()
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                tts_path = tf.name
             try:
                 loop.run_until_complete(_tts_generate(text, voice, tts_path, rate, pitch))
+                if os.path.exists(tts_path) and os.path.getsize(tts_path) > 0:
+                    tts_seg = AudioSegment.from_mp3(tts_path)
+                    result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
+            except Exception as tts_exc:
+                # Log and skip the segment rather than aborting the whole dub
+                app.logger.warning("TTS failed for segment %d (voice=%s): %s", i, voice, tts_exc)
             finally:
-                loop.close()
-            if os.path.exists(tts_path) and os.path.getsize(tts_path) > 0:
-                tts_seg = AudioSegment.from_mp3(tts_path)
-                result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
-        except Exception as tts_exc:
-            # Log and skip the segment rather than aborting the whole dub
-            app.logger.warning("TTS failed for segment %d (voice=%s): %s", i, voice, tts_exc)
-        finally:
-            if os.path.exists(tts_path):
-                os.unlink(tts_path)
+                if os.path.exists(tts_path):
+                    try:
+                        os.unlink(tts_path)
+                    except OSError:
+                        pass
+    finally:
+        loop.close()
 
     return result_audio
 
@@ -765,8 +859,11 @@ def transcribe():
     video_path = os.path.join(video_dir, f"{job_id}{ext}")
     f.save(video_path)
 
-    _jobs[job_id] = {"queue": queue.Queue(), "result": None, "error": None,
-                     "original_filename": f.filename}
+    # Sanitise original filename before storing (strip directory components)
+    safe_filename = Path(f.filename).name
+    with _jobs_lock:
+        _jobs[job_id] = {"queue": queue.Queue(), "result": None, "error": None,
+                         "original_filename": safe_filename}
     threading.Thread(
         target=_run_job,
         args=(job_id, video_path, model_size, language, translate_to),
@@ -837,8 +934,9 @@ def start_dub(job_id: str, lang: str):
     if request.is_json and request.json:
         voice_profiles = request.json.get("voice_profiles", {})
     dub_id = str(uuid.uuid4())
-    _dub_jobs[dub_id] = {"queue": queue.Queue(), "result_path": None, "error": None,
-                         "job_id": job_id, "lang": lang}
+    with _jobs_lock:
+        _dub_jobs[dub_id] = {"queue": queue.Queue(), "result_path": None, "error": None,
+                             "job_id": job_id, "lang": lang}
     threading.Thread(
         target=_dub_job,
         args=(dub_id, job_id, lang, voice_profiles),
@@ -939,7 +1037,8 @@ def start_mux(job_id: str, dub_id: str):
     out_ext = "." + output_format
     audio_bitrate = job.get("source_audio_bitrate", "192k")
     mux_id = str(uuid.uuid4())
-    _mux_jobs[mux_id] = {"queue": queue.Queue(), "result_path": None, "error": None}
+    with _jobs_lock:
+        _mux_jobs[mux_id] = {"queue": queue.Queue(), "result_path": None, "error": None}
     threading.Thread(
         target=_mux_job,
         args=(mux_id, video_path, dub["result_path"],
@@ -1065,17 +1164,20 @@ def set_config():
     if not request.is_json:
         return jsonify(error="JSON required"), 400
     folder = (request.json.get("output_folder") or "").strip()
-    if folder and not os.path.isabs(folder):
-        return jsonify(error="Please provide an absolute path"), 400
     if folder:
+        if not os.path.isabs(folder):
+            return jsonify(error="Please provide an absolute path"), 400
+        # Resolve symlinks / '..' traversal before trusting the path
+        real_folder = os.path.realpath(folder)
         try:
-            os.makedirs(folder, exist_ok=True)
-            _test = os.path.join(folder, ".write_test")
+            os.makedirs(real_folder, exist_ok=True)
+            _test = os.path.join(real_folder, ".write_test")
             with open(_test, "w") as _f:
                 _f.write("ok")
             os.unlink(_test)
         except OSError as exc:
             return jsonify(error=f"Cannot write to folder: {exc}"), 400
+        folder = real_folder  # store the resolved path
     _config["output_folder"] = folder
     msg = f"Saving to: {folder}" if folder else "Auto-save disabled"
     return jsonify(message=msg)
@@ -1275,8 +1377,11 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
     <h2>4 — Generate</h2>
     <button class="btn" id="run-btn" disabled>Generate subtitles</button>
     <div class="progress-wrap" id="progress-wrap" style="margin-top:1rem">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.25rem">
+        <span class="progress-msg" id="progress-msg">Starting&hellip;</span>
+        <span id="progress-pct" style="font-size:.8rem;color:#94a3b8;min-width:2.5rem;text-align:right"></span>
+      </div>
       <div class="progress-bar-bg"><div class="progress-bar" id="progress-bar"></div></div>
-      <div class="progress-msg" id="progress-msg">Starting&hellip;</div>
     </div>
     <div class="error-box" id="error-box"></div>
   </div>
@@ -1502,6 +1607,28 @@ const textOut   = document.getElementById("text-out");
 const metaEl    = document.getElementById("meta");
 const langTabs  = document.getElementById("lang-tabs");
 const dlBar     = document.getElementById("dl-bar");
+const progPct   = document.getElementById("progress-pct");
+
+// Hint table: maps keywords in error messages to actionable advice
+const ERROR_HINTS = [
+  [/ffmpeg|audio extract/i,    "Tip: the file may be corrupted or use an unsupported codec."],
+  [/disk|write|permission/i,   "Tip: check that the output folder is writable and has enough space."],
+  [/translation package/i,     "Tip: the first translation for a language pair downloads a package — ensure internet access."],
+  [/no audio/i,                "Tip: the file may be video-only (no audio track). Try a different file."],
+  [/model|whisper/i,           "Tip: try a smaller model (e.g. tiny or base) to reduce memory usage."],
+  [/tts|edge.tts/i,            "Tip: TTS requires internet access. Check your connection and retry."],
+];
+
+function showError(msg, box) {
+  box = box || errorBox;
+  let hint = "";
+  for (const [re, h] of ERROR_HINTS) { if (re.test(msg)) { hint = " " + h; break; } }
+  progWrap.style.display = "none";
+  box.textContent = msg + hint;
+  box.style.display = "block";
+  runBtn.disabled = false;
+  log("Error: " + msg, "err");
+}
 
 function setFile(f) {
   selectedFile = f;
@@ -1530,6 +1657,11 @@ document.querySelectorAll(".ftab").forEach(btn => {
 
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
+  // 4 GB client-side guard (avoids hanging uploads)
+  if (selectedFile.size > 4 * 1024 * 1024 * 1024) {
+    showError("File too large (max 4 GB). Please compress or trim the video first.");
+    return;
+  }
   errorBox.style.display = "none";
   resultsCard.style.display = "none";
   progWrap.style.display = "block";
@@ -1561,13 +1693,16 @@ function listenProgress(jid) {
   const es = new EventSource("/stream/" + jid);
   es.addEventListener("progress", e => {
     const d = JSON.parse(e.data);
+    const pct = d.pct || 0;
     progMsg.textContent = d.msg;
-    progBar.style.width = (d.pct || 0) + "%";
+    progBar.style.width = pct + "%";
+    progPct.textContent = pct + "%";
     log(d.msg, "prog");
   });
   es.addEventListener("done", async () => {
     es.close();
     progBar.style.width = "100%";
+    progPct.textContent = "100%";
     progMsg.textContent = "Done!";
     log("Transcription done", "ok");
     const r = await fetch("/result/" + jid);
@@ -1579,7 +1714,6 @@ function listenProgress(jid) {
     let msg;
     try { msg = JSON.parse(e.data).msg; } catch(_) { msg = "Transcription failed."; }
     showError(msg);
-    log("Transcription error: " + msg, "err");
   });
 }
 
@@ -1945,8 +2079,7 @@ dubBtn.addEventListener("click", async () => {
 
 function showDubError(msg) {
   dubProgWrap.style.display = "none";
-  dubErrorBox.textContent   = msg;
-  dubErrorBox.style.display = "block";
+  showError(msg, dubErrorBox);
   dubBtn.disabled = false;
 }
 
@@ -2014,8 +2147,7 @@ muxGoBtn.addEventListener("click", async () => {
 
 function showMuxError(msg) {
   muxProgWrap.style.display = "none";
-  muxErrorBox.textContent   = msg;
-  muxErrorBox.style.display = "block";
+  showError(msg, muxErrorBox);
   muxGoBtn.disabled = false;
 }
 </script>
