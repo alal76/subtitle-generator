@@ -33,10 +33,46 @@ Everything runs on your machine. No cloud API keys required.
 
 ---
 
+## Quick Install (one command)
+
+Each script clones the repo, installs all system and Python dependencies, and launches the app automatically.
+
+### macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.sh | bash
+```
+
+### Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.sh | bash
+```
+
+### Windows (PowerShell — run as your normal user)
+
+```powershell
+irm https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.ps1 | iex
+```
+
+> **Custom install directory** — set `VIDEO_SUBTITLER_DIR` before running:  
+> macOS/Linux: `VIDEO_SUBTITLER_DIR=~/apps/subtitler curl … | bash`  
+> Windows: `$env:VIDEO_SUBTITLER_DIR="C:\apps\subtitler"; irm … | iex`
+
+> **Custom port** — set `PORT=8080` (macOS/Linux) or `$env:PORT="8080"` (Windows) the same way.
+
+---
+
 ## Installation & Usage
 
 ### macOS
 
+**One-liner (recommended):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.sh | bash
+```
+
+**Manual steps:**
 ```bash
 # 1. Install ffmpeg (if not already installed)
 brew install ffmpeg
@@ -60,7 +96,15 @@ The app opens automatically at **http://127.0.0.1:5001** in your default browser
 
 ### Windows
 
-#### Option A — Automated (recommended)
+#### Option A — One-liner (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.ps1 | iex
+```
+
+Installs Git, Python 3.11, and ffmpeg automatically via winget, then clones the repo, sets up a virtual environment, and launches the app.
+
+#### Option B — Automated standalone build
 
 Download and double-click **`build_windows.bat`**.
 
@@ -79,7 +123,7 @@ The resulting executable is at:
 ```
 Zip the entire `dist\VideoSubtitler\` folder to share — recipients need neither Python nor ffmpeg.
 
-#### Option B — Run from source
+#### Option C — Run from source
 
 ```bat
 :: In a command prompt or PowerShell:
@@ -104,8 +148,13 @@ python app.py
 
 ### Linux
 
-Linux is **fully supported when running from source**. The standalone PyInstaller build has not been tested on Linux but should work.
+**One-liner (recommended):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/alal76/subtitle-generator/main/install.sh | bash
+```
+Auto-detects your package manager (apt / dnf / pacman / zypper) to install ffmpeg, then clones the repo and launches the app.
 
+**Manual steps:**
 ```bash
 # Debian / Ubuntu
 sudo apt install ffmpeg
@@ -115,6 +164,9 @@ sudo dnf install ffmpeg
 
 # Arch
 sudo pacman -S ffmpeg
+
+# openSUSE
+sudo zypper install ffmpeg
 
 # Then:
 git clone https://github.com/alal76/subtitle-generator.git
