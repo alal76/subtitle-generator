@@ -285,23 +285,33 @@ Selecting both audio options produces a file with both tracks (e.g. English orig
 
 ## GPU Acceleration
 
-Whisper transcription automatically uses an **NVIDIA GPU** when one is detected at startup — no configuration required. The device in use is shown as a badge in the app header.
+Whisper transcription automatically uses the best available compute backend at startup — no configuration required. The device in use is shown as a badge in the app header.
 
-| Scenario | Device used | Speed |
-|---|---|---|
-| NVIDIA GPU (CUDA 12+) | `cuda` — `float16` | 5 – 20× faster than CPU |
-| No GPU / Apple Silicon | `cpu` — `int8` | baseline |
+| Scenario | Device used | Backend | Speed |
+|---|---|---|---|
+| NVIDIA GPU (CUDA 12+) | `cuda` — `float16` | faster-whisper / CTranslate2 | 5 – 20× faster than CPU |
+| Apple Silicon (M1/M2/M3/M4) | `mlx` — `float16` | mlx-whisper (Apple MLX) | 3 – 8× faster than CPU int8 |
+| No GPU / Intel Mac | `cpu` — `int8` | faster-whisper / CTranslate2 | baseline |
 
-> Apple Silicon MPS is **not yet supported** by the CTranslate2 backend. The app falls back to CPU on M-series Macs and still performs well (int8 quantised).
+The `install.sh` and `install.ps1` scripts automatically install the right backend:
 
-### Manual GPU setup (if the install script didn't detect your GPU)
+- **NVIDIA**: pulls `nvidia-cublas-cu12` + `nvidia-cudnn-cu12` wheels (no CUDA toolkit install required)
+- **Apple Silicon**: pulls `mlx-whisper` (runs on the GPU + Neural Engine via Apple's MLX framework)
+- **CPU**: nothing extra; faster-whisper int8 is already shipped via `requirements.txt`
+
+### Manual GPU setup
 
 ```bash
 # Activate the project venv first, then:
+
+# NVIDIA GPU
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+
+# Apple Silicon
+pip install mlx-whisper
 ```
 
-No CUDA toolkit installation is needed — the runtime libraries are shipped as Python wheels.
+No CUDA toolkit or Xcode toolchain is needed — both paths use pre-built wheels.
 
 ```
 ---

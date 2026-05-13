@@ -122,21 +122,44 @@ _pkg_index_lock = threading.Lock()
 
 # ── device detection (runs once at startup) ───────────────────────────────────
 def _detect_device() -> tuple[str, str]:
-    """Return (device, compute_type) for WhisperModel.
+    """Return (device, compute_type) for transcription.
 
-    Priority: CUDA (NVIDIA) > CPU
-    Apple Silicon MPS is not yet supported by CTranslate2.
+    Priority: CUDA (NVIDIA) > Apple Silicon MLX > CPU
     """
+    # 1. NVIDIA CUDA via CTranslate2 (faster-whisper)
     try:
-        import ctranslate2  # already a faster-whisper dependency
+        import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "float16"
     except Exception:
         pass
+    # 2. Apple Silicon GPU/ANE via MLX
+    if sys.platform == "darwin":
+        try:
+            import platform as _plat
+            if _plat.machine() == "arm64":
+                import mlx_whisper  # noqa: F401 — just probing for availability
+                return "mlx", "float16"
+        except Exception:
+            pass
+    # 3. CPU fallback (int8 via faster-whisper)
     return "cpu", "int8"
 
 _DEVICE, _COMPUTE_TYPE = _detect_device()
-_DEVICE_LABEL = "GPU (CUDA)" if _DEVICE == "cuda" else "CPU"
+_DEVICE_LABEL = {
+    "cuda": "GPU (CUDA)",
+    "mlx":  "Apple Silicon (MLX)",
+    "cpu":  "CPU",
+}.get(_DEVICE, "CPU")
+
+# MLX repo mapping: faster-whisper uses size names; mlx-whisper needs HF repo ids.
+_MLX_REPO = {
+    "tiny":     "mlx-community/whisper-tiny-mlx",
+    "base":     "mlx-community/whisper-base-mlx",
+    "small":    "mlx-community/whisper-small-mlx",
+    "medium":   "mlx-community/whisper-medium-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+}
 
 # Response-literal constants (suppress duplicate-string warnings)
 _ERR_UNKNOWN_JOB = "Unknown job"
@@ -221,6 +244,32 @@ def _run_ffprobe(file_path: str) -> dict:
     if r.returncode != 0:
         raise RuntimeError(f"ffprobe error: {r.stderr.decode()}")
     return json.loads(r.stdout.decode())
+
+
+def _transcribe(audio_path: str, model_size: str, language):
+    """Run Whisper on `audio_path` using the best available backend.
+
+    Returns (segs, detected_lang) where segs = [(start, end, text), ...]
+    and detected_lang is a 2-letter ISO code.
+    """
+    if _DEVICE == "mlx":
+        # Apple Silicon GPU / Neural Engine path
+        import mlx_whisper  # type: ignore[import-not-found]
+        repo = _MLX_REPO.get(model_size, _MLX_REPO["small"])
+        result = mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo=repo,
+            language=language,
+            word_timestamps=False,
+        )
+        segs = [(float(s["start"]), float(s["end"]), s["text"].strip())
+                for s in result.get("segments", [])]
+        return segs, result.get("language") or (language or "en")
+    # Default: faster-whisper (CPU int8 or CUDA float16)
+    model = WhisperModel(model_size, device=_DEVICE, compute_type=_COMPUTE_TYPE)
+    segs_gen, info = model.transcribe(audio_path, language=language, beam_size=5)
+    segs = [(s.start, s.end, s.text.strip()) for s in segs_gen]
+    return segs, info.language
 
 
 # ── speaker diarization ───────────────────────────────────────────────────────
@@ -434,15 +483,9 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             job["source_audio_bitrate"] = "192k"
 
         _push(q, "progress", json.dumps({"msg": f"Loading Whisper \u2018{model_size}\u2019 on {_DEVICE_LABEL}\u2026", "pct": 20}))
-        model = WhisperModel(model_size, device=_DEVICE, compute_type=_COMPUTE_TYPE)
-
         lang = None if language == "auto" else language
         _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
-        segs_gen, info = model.transcribe(audio_path, language=lang, beam_size=5)
-        raw_segments = list(segs_gen)
-
-        detected = info.language
-        segs = [(s.start, s.end, s.text.strip()) for s in raw_segments]
+        segs, detected = _transcribe(audio_path, model_size, lang)
 
         # Keep audio and video for dubbing / muxing features
         job["audio_path"] = audio_path

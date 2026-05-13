@@ -109,8 +109,12 @@ if command -v nvidia-smi &>/dev/null; then
   info "NVIDIA GPU detected — installing CUDA runtime libraries for GPU acceleration…"
   pip install --quiet nvidia-cublas-cu12 nvidia-cudnn-cu12
   ok "CUDA runtime libraries installed — Whisper will run on GPU"
+elif [[ "$(uname)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  info "Apple Silicon detected — installing mlx-whisper for GPU/Neural Engine acceleration…"
+  pip install --quiet mlx-whisper
+  ok "mlx-whisper installed — Whisper will run on Apple GPU / Neural Engine"
 else
-  ok "No NVIDIA GPU detected — using CPU (Apple Silicon uses CPU via CTranslate2)"
+  ok "No GPU acceleration available — using CPU"
 fi
 
 ok "Dependencies installed"
