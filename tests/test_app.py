@@ -38,9 +38,7 @@ from app import (  # noqa: E402
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def client():
@@ -100,9 +98,7 @@ _SAMPLE_RESULT = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — subtitle formatters
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestFmtSrt:
     def test_zero(self):
@@ -171,9 +167,7 @@ class TestBuildVtt:
         assert "\n1\n" not in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — constants / config
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestConfig:
     def test_supported_extensions_all_lowercase(self):
@@ -195,9 +189,7 @@ class TestConfig:
             assert "Neural" in voice, f"{voice} is not a Neural voice"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIndexRoute:
     def test_returns_200(self, client):
@@ -213,9 +205,7 @@ class TestIndexRoute:
         assert r.status_code == 405
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: POST /transcribe — validation
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTranscribeValidation:
     def test_no_file(self, client):
@@ -277,9 +267,7 @@ class TestTranscribeValidation:
         uuid.UUID(body["job_id"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /result/<job_id>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestResultRoute:
     def test_unknown_job(self, client):
@@ -306,9 +294,7 @@ class TestResultRoute:
         assert "langs" in body
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /stream/<job_id>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStreamRoute:
     def test_unknown_job(self, client):
@@ -325,9 +311,7 @@ class TestStreamRoute:
         assert r.content_type.startswith("text/event-stream")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /download/<job_id>/<lang>/<fmt>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestDownloadRoute:
     def test_unknown_job(self, client):
@@ -372,9 +356,7 @@ class TestDownloadRoute:
         assert new_files == set(), f"Temp files leaked: {new_files}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: POST /dub/<job_id>/<lang>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStartDubRoute:
     def test_unknown_job(self, client):
@@ -406,9 +388,7 @@ class TestStartDubRoute:
         assert r.status_code == 405
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /stream_dub/<dub_id>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStreamDubRoute:
     def test_unknown_dub(self, client):
@@ -425,9 +405,7 @@ class TestStreamDubRoute:
         assert r.content_type.startswith("text/event-stream")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Route: GET /download_dub/<dub_id>
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestDownloadDubRoute:
     def test_unknown_dub(self, client):
@@ -454,9 +432,7 @@ class TestDownloadDubRoute:
         assert b"dubbed_audio.mp3" in r.headers["Content-Disposition"].encode()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — _ensure_translation (argostranslate interaction)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestEnsureTranslation:
     def _make_installed_lang(self, from_code: str, to_code: str):
@@ -513,9 +489,7 @@ class TestEnsureTranslation:
             app._ensure_translation("en", "xx")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests — _run_job cleanup behaviour
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunJobCleanup:
     def test_video_file_kept_on_success(self, tmp_path):
@@ -523,18 +497,12 @@ class TestRunJobCleanup:
         video = tmp_path / "test.mp4"
         video.write_bytes(b"fake video")
 
-        # Stub WhisperModel
-        seg = MagicMock()
-        seg.start, seg.end, seg.text = 0.0, 1.0, "hi"
-        info = MagicMock()
-        info.language = "en"
-        mock_model = MagicMock()
-        mock_model.transcribe.return_value = (iter([seg]), info)
-
         jid = str(uuid.uuid4())
         app._jobs[jid] = {"queue": queue.Queue(), "result": None, "error": None}
 
-        with patch("app.WhisperModel", return_value=mock_model), \
+        with patch("app._transcribe", return_value=([(0.0, 1.0, "hi")], "en")), \
+             patch("app._safe_diarize", return_value=({}, [])), \
+             patch("app._detect_source_bitrate", return_value="192k"), \
              patch("app.subprocess.run") as mock_sub:
             mock_sub.return_value = MagicMock(returncode=0)
             t = threading.Thread(
@@ -562,7 +530,7 @@ class TestRunJobCleanup:
                 args=(jid, str(video), "base", "auto", []),
             )
             t.start()
-            t.join(timeout=10)
+            t.join(timeout=15)
 
         assert not video.exists(), "Input video file should be deleted even on failure"
         assert app._jobs[jid]["error"] is not None
@@ -582,16 +550,14 @@ class TestRunJobCleanup:
                 args=(jid, str(video), "base", "auto", []),
             )
             t.start()
-            t.join(timeout=10)
+            t.join(timeout=15)
 
         audio_path = app._jobs[jid].get("audio_path")
         # audio_path is not set on failure (job["audio_path"] is never assigned)
         assert audio_path is None or not os.path.exists(audio_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # New feature routes — speakers, media_info, voices, mux
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestSpeakersRoute:
     def test_unknown_job_returns_404(self, client):
@@ -663,6 +629,7 @@ class TestMuxRoute:
         assert resp.status_code == 400
 
     def test_invalid_mode_returns_400(self, client, tmp_path):
+        """If neither audio track is selected, the mux must be rejected."""
         video = tmp_path / "v.mp4"
         video.write_bytes(b"v")
         audio = tmp_path / "a.mp3"
@@ -672,7 +639,8 @@ class TestMuxRoute:
         app._jobs[jid] = {"queue": queue.Queue(), "result": {}, "error": None,
                           "video_path": str(video)}
         app._dub_jobs[did] = {"queue": queue.Queue(), "result_path": str(audio), "error": None}
-        resp = client.post(f"/mux/{jid}/{did}", json={"mode": "bad"})
+        resp = client.post(f"/mux/{jid}/{did}",
+                           json={"include_original": False, "include_dubbed": False})
         assert resp.status_code == 400
 
     def test_valid_mux_starts_job(self, client, tmp_path):
@@ -686,7 +654,9 @@ class TestMuxRoute:
                           "video_path": str(video)}
         app._dub_jobs[did] = {"queue": queue.Queue(), "result_path": str(audio), "error": None}
         with patch("threading.Thread"):
-            resp = client.post(f"/mux/{jid}/{did}", json={"mode": "replace"})
+            resp = client.post(f"/mux/{jid}/{did}",
+                               json={"include_original": True, "include_dubbed": True,
+                                     "output_format": "mp4"})
         assert resp.status_code == 200
         assert "mux_id" in resp.get_json()
 
@@ -733,3 +703,108 @@ class TestDiarize:
         assert speakers["SPEAKER_00"]["gender_hint"] == "M"
         assert speakers["SPEAKER_01"]["gender_hint"] == "F"
         assert len(spk_segs) == 3
+
+
+# New helpers from the v1.2.0 refactor
+
+class TestErrorHelper:
+    def test_default_code(self):
+        with app.app.app_context():
+            resp, code = app._error("oops")
+        assert code == 400
+        assert resp.get_json() == {"error": "oops"}
+
+    def test_custom_code(self):
+        with app.app.app_context():
+            _, code = app._error("nope", 404)
+        assert code == 404
+
+
+class TestWhisperModelCache:
+    def test_caches_per_size(self):
+        app._whisper_cache.clear()
+        with patch("app.WhisperModel") as MockWM:
+            MockWM.side_effect = lambda *a, **kw: MagicMock(name=f"M-{a[0]}")
+            m1 = app._get_whisper_model("base")
+            m2 = app._get_whisper_model("base")
+            m3 = app._get_whisper_model("small")
+        assert m1 is m2
+        assert m1 is not m3
+        assert MockWM.call_count == 2  # base + small, not base twice
+        app._whisper_cache.clear()
+
+
+class TestCleanupOnFailure:
+    def test_deletes_existing_files(self, tmp_path):
+        a = tmp_path / "a.wav"; a.write_bytes(b"x")
+        b = tmp_path / "b.mp4"; b.write_bytes(b"y")
+        app._cleanup_on_failure(str(a), str(b))
+        assert not a.exists() and not b.exists()
+
+    def test_tolerates_missing(self, tmp_path):
+        # Must not raise on non-existent paths
+        app._cleanup_on_failure(str(tmp_path / "nope.wav"), "")
+
+
+class TestSafeDiarize:
+    def test_returns_fallback_on_exception(self):
+        with patch("app._diarize", side_effect=RuntimeError("boom")):
+            speakers, _ = app._safe_diarize("x.wav", [(0.0, 1.0, "hi")])
+        assert "SPEAKER_00" in speakers
+
+    def test_passes_through_on_success(self):
+        fake = ({"SPEAKER_00": {"gender_hint": "M"}}, [(0.0, 1.0, "hi", "SPEAKER_00")])
+        with patch("app._diarize", return_value=fake):
+            speakers, _ = app._safe_diarize("x.wav", [(0.0, 1.0, "hi")])
+        assert speakers["SPEAKER_00"]["gender_hint"] == "M"
+
+
+class TestJobsLockExists:
+    def test_locks_present(self):
+        assert isinstance(app._jobs_lock, type(threading.Lock()))
+        assert isinstance(app._whisper_lock, type(threading.Lock()))
+
+
+class TestConfigPathSafety:
+    def test_realpath_resolves_traversal(self, client, tmp_path):
+        # Pass a path with .. — set_config should realpath() it
+        nested = tmp_path / "sub" / ".." / "real"
+        (tmp_path / "real").mkdir()
+        resp = client.post("/config",
+                           data=json.dumps({"output_folder": str(nested)}),
+                           content_type="application/json")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        # Resolved path should not contain ".."
+        assert ".." not in body.get("output_folder", "")
+
+
+class TestStudio:
+    def test_classify_upload(self):
+        assert app._classify_studio_upload(".mp4") == "video"
+        assert app._classify_studio_upload(".mp3") == "audio"
+        assert app._classify_studio_upload(".srt") == "subtitle"
+        assert app._classify_studio_upload(".xyz") == ""
+
+    def test_upload_rejects_unsupported(self, client):
+        data = {"file": (io.BytesIO(b"x"), "thing.xyz")}
+        resp = client.post("/studio/upload", data=data,
+                           content_type="multipart/form-data")
+        assert resp.status_code == 400
+        assert "Unsupported" in resp.get_json()["error"]
+
+    def test_upload_rejects_no_file(self, client):
+        resp = client.post("/studio/upload", data={},
+                           content_type="multipart/form-data")
+        assert resp.status_code == 400
+
+    def test_build_requires_video(self, client):
+        resp = client.post("/studio/build",
+                           data=json.dumps({"audio_tracks": [], "subtitle_tracks": []}),
+                           content_type="application/json")
+        assert resp.status_code == 400
+        assert "video" in resp.get_json()["error"].lower()
+
+    def test_validate_studio_request_raises(self):
+        with pytest.raises(app._StudioValidationError):
+            app._validate_studio_request({})

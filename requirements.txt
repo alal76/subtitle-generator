@@ -5,5 +5,7 @@ edge-tts>=6.1.9
 pydub>=0.25.1
 librosa>=0.10.0
 scikit-learn>=1.3.0
+# Vocal/background separation for dubbing (keeps music intact under TTS):
+demucs>=4.0.0
 # Apple Silicon GPU acceleration (auto-installed by install.sh on arm64 macOS):
 # mlx-whisper>=0.4.0

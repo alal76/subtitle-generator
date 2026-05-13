@@ -17,10 +17,56 @@ else:
     _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
     _BUNDLE_DIR  = _PROJECT_DIR
 
+
+def _load_dotenv(path: str) -> None:
+    """Minimal .env loader (KEY=VALUE per line). Skips existing env vars,
+    comments, and blank lines. Strips surrounding quotes."""
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                key, _, val = s.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except OSError:
+        pass
+
+
+_load_dotenv(os.path.join(_PROJECT_DIR, ".env"))
+# Mirror HF_TOKEN to HUGGING_FACE_HUB_TOKEN (some libs read the long form).
+if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
 _LOCAL_CACHE = os.path.join(_PROJECT_DIR, ".local_cache")
 os.makedirs(_LOCAL_CACHE, exist_ok=True)
 os.environ["HF_HOME"]       = os.path.join(_LOCAL_CACHE, "huggingface")
 os.environ["XDG_DATA_HOME"] = os.path.join(_LOCAL_CACHE, "data")
+
+
+def _purge_runtime_cache() -> None:
+    """Delete stale uploads / extracted audio / mux artefacts on startup.
+
+    Preserves the huggingface and data subdirs so cached models / argos
+    translation packages survive restarts.
+    """
+    import shutil as _shutil
+    for sub in ("video", "audio", "mux"):
+        p = os.path.join(_LOCAL_CACHE, sub)
+        if os.path.isdir(p):
+            try:
+                _shutil.rmtree(p, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+        os.makedirs(p, exist_ok=True)
+
+
+_purge_runtime_cache()
 
 
 def _find_ffmpeg() -> str:
@@ -55,6 +101,7 @@ import json
 import queue
 import subprocess
 import tempfile
+import textwrap
 import threading
 import uuid
 import webbrowser
@@ -68,6 +115,9 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 app = Flask(__name__)
 
 SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".wmv"}
+_STUDIO_VIDEO_EXTS    = SUPPORTED_EXTENSIONS
+_STUDIO_AUDIO_EXTS    = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
+_STUDIO_SUBTITLE_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 
 WHISPER_LANGUAGES = [
@@ -116,6 +166,7 @@ EDGE_TTS_VOICES = {
 _jobs: dict = {}
 _dub_jobs: dict = {}
 _mux_jobs: dict = {}
+_studio_uploads: dict = {}  # token -> {"path","kind","name","duration","size"}
 _config: dict = {"output_folder": ""}
 _pkg_index_fetched = False
 _pkg_index_lock = threading.Lock()
@@ -126,6 +177,7 @@ _whisper_lock  = threading.Lock()
 # Response-literal constants (suppress duplicate-string warnings)
 _ERR_UNKNOWN_JOB = "Unknown job"
 _ERR_NOT_FOUND = "Not found"
+_ERR_NO_FILE = "No file provided"
 _MIME_SSE = "text/event-stream"
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -285,17 +337,24 @@ def _run_ffprobe(file_path: str) -> dict:
     return json.loads(r.stdout.decode())
 
 
-def _transcribe(audio_path: str, model_size: str, language) -> tuple[list, str]:
+def _transcribe(audio_path: str, model_size: str, language,
+                progress_cb=None, audio_duration: float = 0.0) -> tuple[list, str]:
     """Run Whisper on `audio_path` using the best available backend.
 
     Returns (segs, detected_lang) where segs = [(start, end, text), ...]
     and detected_lang is a 2-letter ISO code.
+
+    progress_cb(msg, pct) — optional callback for fine-grained progress
+    between the 40 % and 55 % range used by the caller.
     """
     if _DEVICE == "mlx":
         # Apple Silicon GPU / Neural Engine path
         import mlx_whisper  # type: ignore[import-not-found]
         from typing import Any, cast
         repo = _MLX_REPO.get(model_size, _MLX_REPO["small"])
+        _ensure_mlx_model(repo, progress_cb)
+        if progress_cb:
+            progress_cb(f"Transcribing with {model_size} (Apple Silicon)\u2026", 45)
         result: dict = cast(Any, mlx_whisper.transcribe(
             audio_path,
             path_or_hf_repo=repo,
@@ -306,11 +365,80 @@ def _transcribe(audio_path: str, model_size: str, language) -> tuple[list, str]:
                 for s in result.get("segments", [])]
         detected_lang = result.get("language") or (language or "en")
         return segs, str(detected_lang)
-    # Default: faster-whisper (CPU int8 or CUDA float16)
+    # Default: faster-whisper (CPU int8 or CUDA float16) — yields segments
+    # progressively, so we can report real progress.
     model = _get_whisper_model(model_size)
     segs_gen, info = model.transcribe(audio_path, language=language, beam_size=5)
-    segs = [(s.start, s.end, s.text.strip()) for s in segs_gen]
+    segs: list = []
+    for s in segs_gen:
+        segs.append((s.start, s.end, s.text.strip()))
+        if progress_cb and audio_duration > 0:
+            frac = min(1.0, s.end / audio_duration)
+            pct = 40 + int(15 * frac)  # 40 → 55
+            progress_cb(f"Transcribing\u2026 {int(frac * 100)}%", pct)
     return segs, info.language
+
+
+def _emit_hf_progress(bar, progress_cb) -> None:
+    """Forward a single tqdm tick to *progress_cb* (byte-scale bars only)."""
+    if not progress_cb:
+        return
+    total = float(getattr(bar, "total", 0) or 0)
+    done = float(getattr(bar, "n", 0) or 0)
+    unit = (getattr(bar, "unit", "") or "").lower()
+    if total <= 0 or "b" not in unit:
+        return
+    import time as _t
+    now = _t.monotonic()
+    last = getattr(bar, "_last_emit", 0.0)
+    if now - last < 0.33 and done < total:
+        return
+    bar._last_emit = now
+    frac = min(1.0, done / total)
+    mb_done = done / (1024 * 1024)
+    mb_total = total / (1024 * 1024)
+    pct = 25 + int(15 * frac)  # 25 → 40
+    progress_cb(
+        f"Downloading model\u2026 {mb_done:,.0f} / {mb_total:,.0f} MB ({int(frac * 100)}%)",
+        pct,
+    )
+
+
+def _ensure_mlx_model(repo: str, progress_cb=None) -> None:
+    """Pre-download the MLX whisper model so progress can be reported.
+
+    Streams real-time download progress (MB transferred / total, %) into the
+    activity log via *progress_cb* so the user sees the UI is alive while a
+    multi-GB model is being fetched. No-op when the model is already cached.
+    """
+    try:
+        from huggingface_hub import snapshot_download  # type: ignore
+        from tqdm.auto import tqdm as _tqdm_base  # type: ignore
+    except Exception:
+        return
+    if progress_cb:
+        progress_cb(f"Preparing model {repo} (first run may download ~1\u20133 GB)\u2026", 25)
+
+    class _HFProgress(_tqdm_base):  # type: ignore[misc, valid-type]
+        def update(self, n=1):  # type: ignore[override]
+            ret = super().update(n)
+            try:
+                _emit_hf_progress(self, progress_cb)
+            except Exception:  # noqa: BLE001
+                pass
+            return ret
+
+    try:
+        snapshot_download(repo_id=repo, tqdm_class=_HFProgress)
+    except Exception as exc:  # noqa: BLE001
+        # Older / forked huggingface_hub may not accept tqdm_class — retry plain.
+        app.logger.info("snapshot_download tqdm_class unsupported (%s); retrying", exc)
+        try:
+            snapshot_download(repo_id=repo)
+        except Exception as exc2:  # noqa: BLE001
+            app.logger.warning("Model snapshot_download failed for %s: %s", repo, exc2)
+    if progress_cb:
+        progress_cb("Model ready", 40)
 
 
 # ── speaker diarization ───────────────────────────────────────────────────────
@@ -621,8 +749,23 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
             "pct": 20,
         }))
         lang = None if language == "auto" else language
+
+        # Compute audio duration so faster-whisper can report real progress.
+        audio_duration = 0.0
+        try:
+            probe = _run_ffprobe(audio_path)
+            audio_duration = float(probe.get("format", {}).get("duration", 0) or 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _on_progress(msg: str, pct: int):
+            _push(q, "progress", json.dumps({"msg": msg, "pct": pct}))
+
         _push(q, "progress", json.dumps({"msg": "Transcribing audio\u2026", "pct": 40}))
-        segs, detected = _transcribe(audio_path, model_size, lang)
+        segs, detected = _transcribe(
+            audio_path, model_size, lang,
+            progress_cb=_on_progress, audio_duration=audio_duration,
+        )
 
         # Keep audio and video for dubbing / muxing features
         job["audio_path"] = audio_path
@@ -647,8 +790,9 @@ def _run_job(job_id: str, video_path: str, model_size: str, language: str, trans
         _autosave_subtitles(_config.get("output_folder", ""), base, langs_result)
         _push(q, "done", json.dumps({"msg": "Done!"}))
     except Exception as exc:
-        job["error"] = str(exc)
-        _push(q, "error", json.dumps({"msg": str(exc)}))
+        app.logger.exception("Job %s failed during transcription pipeline", job_id)
+        job["error"] = str(exc) or exc.__class__.__name__
+        _push(q, "error", json.dumps({"msg": f"{exc.__class__.__name__}: {exc}".strip(": ")}))
         _cleanup_on_failure(audio_path, video_path)
     finally:
         # audio_path and video_path are kept on success for dubbing/muxing
@@ -701,11 +845,33 @@ def _dub_job(dub_id: str, job_id: str, lang: str, voice_profiles=None):
 
         orig_audio = AudioSegment.from_wav(audio_path)
 
-        _push(q, "progress", json.dumps({"msg": "Ducking original speech\u2026", "pct": 10}))
-        ducked = _duck_speech(orig_audio, raw_segs)
+        def _on_dub_progress(msg: str, pct: int):
+            _push(q, "progress", json.dumps({"msg": msg, "pct": pct}))
+
+        # Prefer true vocal-removal so background music survives the dub.
+        # Falls back to a simple duck-on-speech if demucs is unavailable.
+        instrumental_path = _separate_instrumental(audio_path, _on_dub_progress)
+        if instrumental_path:
+            base_audio = AudioSegment.from_wav(instrumental_path)
+            # Demucs may return a slightly different length than the source;
+            # pad/truncate to keep TTS timestamps aligned.
+            if len(base_audio) < len(orig_audio):
+                base_audio = base_audio + AudioSegment.silent(
+                    duration=len(orig_audio) - len(base_audio),
+                    frame_rate=base_audio.frame_rate,
+                )
+            elif len(base_audio) > len(orig_audio):
+                base_audio = base_audio[: len(orig_audio)]
+        else:
+            _push(q, "progress", json.dumps({
+                "msg": "Vocal isolation unavailable \u2014 ducking original speech instead\u2026",
+                "pct": 10,
+            }))
+            base_audio = _duck_speech(orig_audio, raw_segs)
 
         result_audio = _overlay_tts(
-            ducked, raw_segs, seg_to_speaker, voice_profiles, default_voice, q
+            base_audio, raw_segs, seg_to_speaker, voice_profiles, default_voice, q,
+            reference_audio=orig_audio,
         )
 
         _push(q, "progress", json.dumps({"msg": "Exporting MP3\u2026", "pct": 93}))
@@ -759,6 +925,101 @@ def _prepare_dub_inputs(job_id: str, lang: str) -> tuple:
     return audio_path, raw_segs, seg_to_speaker
 
 
+def _pick_torch_device() -> str:
+    """Return the best available torch device string for demucs."""
+    try:
+        import torch  # type: ignore
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:  # noqa: BLE001
+        pass
+    return "cpu"
+
+
+def _stream_demucs_progress(proc, progress_cb) -> None:
+    """Forward demucs stdout/stderr percentages into *progress_cb*."""
+    if proc.stdout is None or not progress_cb:
+        if proc.stdout is not None:
+            # Drain so the child doesn't block on a full pipe.
+            for _ in proc.stdout:
+                continue
+        return
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line or "%" not in line:
+            continue
+        try:
+            pct_token = line.split("%")[0].strip().split()[-1]
+            frac = max(0.0, min(1.0, float(pct_token) / 100.0))
+            progress_cb(f"Separating vocals\u2026 {int(frac * 100)}%", 8 + int(10 * frac))
+        except (ValueError, IndexError):
+            continue
+
+
+def _separate_instrumental(audio_path: str, progress_cb=None):
+    """Run demucs on *audio_path* and return the path to the no-vocals stem.
+
+    Returns ``None`` if demucs is unavailable or separation fails — caller
+    should fall back to ducking. The stem is cached under
+    ``.local_cache/audio/stems`` keyed by the source filename so repeat
+    dubs are instant.
+    """
+    try:
+        import importlib
+        importlib.import_module("demucs.separate")
+    except Exception:  # noqa: BLE001
+        return None
+
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    out_dir = os.path.join(_LOCAL_CACHE, "audio", "stems")
+    no_vocals = os.path.join(out_dir, f"{base}_no_vocals.wav")
+    if os.path.isfile(no_vocals) and os.path.getsize(no_vocals) > 1024:
+        return no_vocals
+    os.makedirs(out_dir, exist_ok=True)
+
+    if progress_cb:
+        progress_cb("Separating vocals from background music\u2026 (this may take a few minutes)", 8)
+
+    work_dir = os.path.join(out_dir, "_demucs_work")
+    os.makedirs(work_dir, exist_ok=True)
+    cmd = [
+        sys.executable, "-m", "demucs.separate",
+        "-n", "htdemucs",
+        "--two-stems", "vocals",
+        "-d", _pick_torch_device(),
+        "-o", work_dir,
+        audio_path,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        _stream_demucs_progress(proc, progress_cb)
+        rc = proc.wait()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("demucs separation failed: %s", exc)
+        return None
+    if rc != 0:
+        app.logger.warning("demucs exited with code %s", rc)
+        return None
+
+    produced = os.path.join(work_dir, "htdemucs", base, "no_vocals.wav")
+    if not os.path.isfile(produced):
+        return None
+    try:
+        import shutil as _shutil
+        _shutil.move(produced, no_vocals)
+        _shutil.rmtree(work_dir, ignore_errors=True)
+    except OSError:
+        return produced
+    if progress_cb:
+        progress_cb("Vocal separation complete", 18)
+    return no_vocals
+
+
 def _duck_speech(audio, raw_segs: list):
     """Return a copy of audio with speech windows reduced by −20 dB."""
     ducked = audio
@@ -773,8 +1034,15 @@ def _duck_speech(audio, raw_segs: list):
 
 
 def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
-                 voice_profiles: dict, default_voice: str, q):
-    """Generate per-segment TTS and overlay onto base_audio. Returns new AudioSegment."""
+                 voice_profiles: dict, default_voice: str, q,
+                 reference_audio=None):
+    """Generate per-segment TTS and overlay onto base_audio.
+
+    When ``reference_audio`` is provided, each TTS clip is gain-matched so its
+    loudness (dBFS) equals the corresponding window of the original speech.
+    This keeps the dub at the same perceived volume as the original speaker
+    instead of whatever level edge-tts produces.
+    """
     from pydub import AudioSegment  # already imported in caller, safe to re-import
     AudioSegment.converter = FFMPEG
     result_audio = base_audio
@@ -784,7 +1052,7 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
     # Reuse one event loop for all segments rather than spawning one per call.
     loop = asyncio.new_event_loop()
     try:
-        for i, (start, _end, text) in enumerate(raw_segs):
+        for i, (start, end, text) in enumerate(raw_segs):
             pct = 15 + int(75 * (i + 1) / max(total, 1))
             _push(q, "progress", json.dumps({
                 "msg": f"Generating speech {i + 1}/{total}\u2026", "pct": pct
@@ -804,6 +1072,7 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
                 loop.run_until_complete(_tts_generate(text, voice, tts_path, rate, pitch))
                 if os.path.exists(tts_path) and os.path.getsize(tts_path) > 0:
                     tts_seg = AudioSegment.from_mp3(tts_path)
+                    tts_seg = _match_loudness(tts_seg, reference_audio, start, end)
                     result_audio = result_audio.overlay(tts_seg, position=int(start * 1000))
             except Exception as tts_exc:
                 # Log and skip the segment rather than aborting the whole dub
@@ -818,6 +1087,29 @@ def _overlay_tts(base_audio, raw_segs: list, seg_to_speaker: dict,
         loop.close()
 
     return result_audio
+
+
+def _match_loudness(tts_seg, reference_audio, start: float, end: float):
+    """Scale ``tts_seg`` so its dBFS matches the reference window [start, end].
+
+    Falls back to the original TTS clip when the reference is missing or the
+    window is too short / silent to measure reliably.
+    """
+    if reference_audio is None:
+        return tts_seg
+    s_ms = max(0, int(start * 1000))
+    e_ms = min(int(end * 1000), len(reference_audio))
+    if e_ms - s_ms < 100:  # need at least 100 ms for a reliable RMS
+        return tts_seg
+    ref_window = reference_audio[s_ms:e_ms]
+    target_db = ref_window.dBFS
+    tts_db = tts_seg.dBFS
+    # dBFS is -inf for digital silence; guard against it.
+    if target_db == float("-inf") or tts_db == float("-inf"):
+        return tts_seg
+    # Clamp the adjustment so a freak-loud reference can't blow out the dub.
+    gain = max(-30.0, min(15.0, target_db - tts_db))
+    return tts_seg.apply_gain(gain)
 
 
 # ── routes ─────────────────────────────────────────────────────────────────────
@@ -836,7 +1128,7 @@ def index():
 def transcribe():
     f = request.files.get("video")
     if not f or not f.filename:
-        return jsonify(error="No file provided"), 400
+        return jsonify(error=_ERR_NO_FILE), 400
     ext = Path(f.filename).suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
         return jsonify(error=f"Unsupported format '{ext}'"), 400
@@ -1079,9 +1371,238 @@ def download_muxed(mux_id: str):
     return send_file(
         mux["result_path"],
         as_attachment=True,
-        download_name=f"dubbed_video{ext}",
+        download_name=mux.get("download_name") or f"dubbed_video{ext}",
         mimetype=mime,
     )
+
+
+# ── Video Studio (multi-stream muxer) ────────────────────────────────────────
+
+def _classify_studio_upload(ext: str) -> str:
+    if ext in _STUDIO_VIDEO_EXTS:
+        return "video"
+    if ext in _STUDIO_AUDIO_EXTS:
+        return "audio"
+    if ext in _STUDIO_SUBTITLE_EXTS:
+        return "subtitle"
+    return ""
+
+
+def _probe_duration(path: str) -> float:
+    try:
+        meta = _run_ffprobe(path)
+        return float(meta.get("format", {}).get("duration", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+@app.route("/studio/upload", methods=["POST"])
+def studio_upload():
+    """Accept any video / audio / subtitle file for the Studio mux pane."""
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return _error(_ERR_NO_FILE)
+    safe_name = Path(f.filename).name
+    ext = Path(safe_name).suffix.lower()
+    kind = _classify_studio_upload(ext)
+    if not kind:
+        return _error(f"Unsupported file type '{ext}'")
+    token = str(uuid.uuid4())
+    studio_dir = os.path.join(_LOCAL_CACHE, "studio")
+    os.makedirs(studio_dir, exist_ok=True)
+    dest = os.path.join(studio_dir, f"{token}{ext}")
+    try:
+        f.save(dest)
+    except OSError as exc:
+        return _error(f"Save failed: {exc}", code=500)
+    duration = _probe_duration(dest) if kind in ("video", "audio") else 0.0
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        size = 0
+    rec = {
+        "path": dest,
+        "kind": kind,
+        "name": safe_name,
+        "ext": ext,
+        "duration": duration,
+        "size": size,
+    }
+    with _jobs_lock:
+        _studio_uploads[token] = rec
+    return jsonify(token=token, kind=kind, name=safe_name,
+                   duration=duration, size=size, ext=ext)
+
+
+def _studio_lookup(token: str, kind: str):
+    rec = _studio_uploads.get(token)
+    if not rec or rec.get("kind") != kind:
+        return None
+    if not rec.get("path") or not os.path.isfile(rec["path"]):
+        return None
+    return rec
+
+
+def _add_stream_metadata(cmd: list, stream_type: str, items: list) -> None:
+    """Append per-stream ffmpeg ``-metadata:s:<type>:N`` flags for *items*."""
+    for idx, meta in enumerate(items):
+        lang = meta.get("lang")
+        label = meta.get("label")
+        if lang:
+            cmd.extend([f"-metadata:s:{stream_type}:{idx}", f"language={lang}"])
+        if label:
+            cmd.extend([f"-metadata:s:{stream_type}:{idx}", f"title={label}"])
+
+
+def _build_studio_ffmpeg(video_path: str, audio_paths: list, sub_paths: list,
+                         audio_meta: list, sub_meta: list, out_path: str,
+                         audio_bitrate: str) -> list:
+    """Assemble an ffmpeg command for the Studio mux job."""
+    cmd: list = [FFMPEG, "-y", "-i", video_path]
+    for p in audio_paths + sub_paths:
+        cmd += ["-i", p]
+    cmd += ["-map", "0:v:0"]
+    for i in range(len(audio_paths)):
+        cmd += ["-map", f"{1 + i}:a:0"]
+    sub_input_base = 1 + len(audio_paths)
+    for i in range(len(sub_paths)):
+        cmd += ["-map", f"{sub_input_base + i}:s:0"]
+    cmd += ["-c:v", "copy"]
+    if audio_paths:
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate]
+    if sub_paths:
+        out_ext = Path(out_path).suffix.lower()
+        sub_codec = "mov_text" if out_ext == ".mp4" else "srt"
+        cmd += ["-c:s", sub_codec]
+    _add_stream_metadata(cmd, "a", audio_meta)
+    _add_stream_metadata(cmd, "s", sub_meta)
+    cmd += [out_path]
+    return cmd
+
+
+def _studio_mux_job(mux_id: str, video_path: str, audio_paths: list,
+                    sub_paths: list, audio_meta: list, sub_meta: list,
+                    out_ext: str, audio_bitrate: str, download_name: str):
+    mux = _mux_jobs[mux_id]
+    q = mux["queue"]
+    out_dir = os.path.join(_LOCAL_CACHE, "mux")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{mux_id}{out_ext}")
+    try:
+        _push(q, "progress", json.dumps({
+            "msg": f"Bundling {len(audio_paths)} audio + {len(sub_paths)} subtitle track(s)\u2026",
+            "pct": 15,
+        }))
+        cmd = _build_studio_ffmpeg(video_path, audio_paths, sub_paths,
+                                   audio_meta, sub_meta, out_path,
+                                   audio_bitrate)
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError("ffmpeg error: " + r.stderr.decode(errors="replace")[:400])
+        mux["result_path"] = out_path
+        mux["download_name"] = download_name
+        # Auto-save to configured output folder
+        _out_folder = _config.get("output_folder", "")
+        if _out_folder:
+            try:
+                import shutil as _shutil
+                os.makedirs(_out_folder, exist_ok=True)
+                _shutil.copy2(out_path, os.path.join(_out_folder, download_name))
+            except Exception as _e:
+                app.logger.warning("Auto-save studio video failed: %s", _e)
+        _push(q, "done", json.dumps({"msg": "Video ready!"}))
+    except Exception as exc:
+        app.logger.exception("Studio mux %s failed", mux_id)
+        mux["error"] = str(exc)
+        _push(q, "error", json.dumps({"msg": str(exc)}))
+    finally:
+        q.put(None)
+
+
+class _StudioValidationError(Exception):
+    def __init__(self, msg: str, code: int = 400):
+        super().__init__(msg)
+        self.code = code
+
+
+def _parse_track_entries(entries: list, kind: str) -> list:
+    """Resolve a list of ``{token,lang,label}`` entries to track records."""
+    if not isinstance(entries, list):
+        raise _StudioValidationError(f"{kind}_tracks must be an array")
+    out: list = []
+    for e in entries:
+        if not isinstance(e, dict):
+            raise _StudioValidationError(f"Invalid {kind} track entry")
+        rec = _studio_lookup(e.get("token", ""), kind)
+        if not rec:
+            raise _StudioValidationError(
+                f"A {kind} track reference is invalid or expired")
+        out.append({
+            "rec": rec,
+            "lang": (e.get("lang") or "")[:3],
+            "label": (e.get("label") or "")[:64],
+        })
+    return out
+
+
+def _validate_studio_request(payload: dict) -> tuple:
+    """Return ``(video_rec, audio_records, sub_records, output_format)``.
+
+    Raises ``_StudioValidationError`` with a user-facing message on failure.
+    """
+    video = _studio_lookup(payload.get("video_token", ""), "video")
+    if not video:
+        raise _StudioValidationError("Missing or invalid video file")
+    audio_records = _parse_track_entries(payload.get("audio_tracks") or [], "audio")
+    sub_records = _parse_track_entries(payload.get("subtitle_tracks") or [], "subtitle")
+    output_format = payload.get("output_format", "mp4")
+    if output_format not in ("mp4", "mkv"):
+        output_format = "mp4"
+    return video, audio_records, sub_records, output_format
+
+
+@app.route("/studio/build", methods=["POST"])
+def studio_build():
+    if not request.is_json:
+        return _error("JSON body required")
+    payload = request.get_json(silent=True) or {}
+    try:
+        video, audio_records, sub_records, output_format = _validate_studio_request(payload)
+    except _StudioValidationError as exc:
+        return _error(str(exc), code=exc.code)
+    out_ext = "." + output_format
+
+    audio_paths = [a["rec"]["path"] for a in audio_records]
+    sub_paths = [s["rec"]["path"] for s in sub_records]
+    audio_meta = [{"lang": a["lang"], "label": a["label"]} for a in audio_records]
+    sub_meta = [{"lang": s["lang"], "label": s["label"]} for s in sub_records]
+    base = Path(video["name"]).stem
+    download_name = f"{base}_studio{out_ext}"
+    audio_bitrate = "192k"
+
+    mux_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _mux_jobs[mux_id] = {
+            "queue": queue.Queue(),
+            "result_path": None,
+            "error": None,
+            "download_name": download_name,
+        }
+    threading.Thread(
+        target=_studio_mux_job,
+        args=(mux_id, video["path"], audio_paths, sub_paths,
+              audio_meta, sub_meta, out_ext, audio_bitrate, download_name),
+        daemon=True,
+    ).start()
+    return jsonify(mux_id=mux_id)
+
+
+@app.route("/studio/uploads", methods=["DELETE"])
+def studio_clear_uploads():
+    """Drop all in-memory studio upload tokens (files remain on disk until cache purge)."""
+    with _jobs_lock:
+        _studio_uploads.clear()
+    return jsonify(ok=True)
 
 
 @app.route("/stream_dub/<dub_id>", methods=["GET"])
@@ -1131,23 +1652,34 @@ def browse_folder():
     Returns {"path": ""} gracefully when a display / tkinter is unavailable
     (headless Linux servers, CI, etc.).
     """
-    script = (
-        "import sys; "
-        "try:\n"
-        "    import tkinter as tk\n"
-        "    from tkinter import filedialog\n"
-        "    root = tk.Tk(); root.withdraw()\n"
-        "    try: root.wm_attributes('-topmost', True)\n"
-        "    except Exception: pass\n"
-        "    path = filedialog.askdirectory(title='Select output folder')\n"
-        "    print(path, end='')\n"
-        "except Exception as e:\n"
-        "    print('__error__:' + str(e), end='', file=sys.stderr)"
-    )
+    script = textwrap.dedent("""
+        import sys
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.wm_attributes('-topmost', True)
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+            path = filedialog.askdirectory(
+                title='Select output folder',
+                mustexist=True,
+                parent=root,
+            )
+            root.update()
+            root.destroy()
+            sys.stdout.write(path or '')
+        except Exception as e:
+            sys.stderr.write('__error__:' + str(e))
+    """).strip()
     try:
         result = subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
         )
         path = result.stdout.strip()
         if not path and result.stderr.startswith("__error__:"):
@@ -1231,6 +1763,17 @@ select{background:#0f172a;border:1px solid #475569;color:#e2e8f0;border-radius:6
 .fmt-bar{display:flex;gap:.4rem;margin-bottom:.6rem}
 .ftab{background:transparent;border:1px solid #334155;color:#94a3b8;border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;transition:all .15s}
 .ftab.active{background:#334155;color:#e2e8f0}
+.top-tabs{display:flex;gap:.4rem;margin-bottom:1rem;border-bottom:1px solid #334155;padding-bottom:.5rem}
+.ttab{background:transparent;border:1px solid transparent;color:#94a3b8;border-radius:8px 8px 0 0;padding:.6rem 1.2rem;font-size:.95rem;font-weight:500;cursor:pointer;transition:all .15s}
+.ttab:hover{color:#cbd5e1;background:#1e293b}
+.ttab.active{background:#1e293b;border-color:#334155;border-bottom-color:#1e293b;color:#a5b4fc}
+.tab-pane[hidden]{display:none}
+.studio-track-row{display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:.5rem}
+.studio-track-row input[type=file]{flex:2;min-width:140px}
+.studio-track-row input[type=text]{background:#1e293b;border:1px solid #475569;color:#e2e8f0;border-radius:4px;padding:.3rem .5rem;font-size:.8rem}
+.studio-track-row .lang-in{width:55px}
+.studio-track-row .label-in{flex:1;min-width:90px}
+.studio-track-row .rm-btn{background:#7f1d1d;border:1px solid #b91c1c;color:#fecaca;border-radius:4px;padding:.25rem .55rem;font-size:.75rem;cursor:pointer}
 textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:.75rem;font-size:.85rem;font-family:monospace;resize:vertical;line-height:1.55}
 .dl-bar{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:.75rem}
 .dl-btn{background:#0f4c75;color:#7dd3fc;border:1px solid #0369a1;border-radius:6px;padding:.4rem 1rem;font-size:.82rem;text-decoration:none;display:inline-block;transition:background .15s}
@@ -1314,6 +1857,14 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
     </div>
     <div id="folder-status" style="font-size:.76rem;margin-top:.35rem;color:#64748b"></div>
   </div>
+
+  <!-- Top-level tabs -->
+  <div class="top-tabs" role="tablist">
+    <button class="ttab active" data-pane="dub" role="tab">&#127908; Auto Subtitle &amp; Dub</button>
+    <button class="ttab" data-pane="studio" role="tab">&#127916; Video Studio</button>
+  </div>
+
+  <div class="tab-pane active" id="tab-pane-dub" role="tabpanel">
 
   <!-- Step 1 -->
   <div class="card">
@@ -1463,6 +2014,66 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;bo
       </div>
     </div>
   </div>
+
+  </div><!-- /#tab-pane-dub -->
+
+  <div class="tab-pane" id="tab-pane-studio" role="tabpanel" hidden>
+    <div class="card">
+      <h2>&#127916; Video Studio <span style="font-weight:400;color:#475569;font-size:.82rem">(combine arbitrary streams into a single file)</span></h2>
+      <p style="color:#94a3b8;font-size:.85rem;margin:.25rem 0 .75rem">
+        Pick one video, then attach any number of audio &amp; subtitle tracks. The video stream is copied (no re-encode); audio is re-encoded to AAC for compatibility.
+      </p>
+
+      <!-- Video -->
+      <div class="field">
+        <label>Video file <span style="color:#ef4444">*</span></label>
+        <div class="row" style="gap:.5rem;align-items:center">
+          <input type="file" id="studio-video-input" accept=".mp4,.mkv,.avi,.mov,.webm,.flv,.m4v,.wmv" style="flex:1"/>
+          <span id="studio-video-status" style="font-size:.78rem;color:#64748b"></span>
+        </div>
+      </div>
+
+      <!-- Audio tracks -->
+      <div class="field" style="margin-top:1rem">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <label style="margin:0">Audio tracks</label>
+          <button class="btn" id="studio-add-audio" style="padding:.35rem .8rem;font-size:.78rem;background:#1e293b;border:1px solid #475569">+ Add audio</button>
+        </div>
+        <div id="studio-audio-list" style="margin-top:.5rem"></div>
+      </div>
+
+      <!-- Subtitle tracks -->
+      <div class="field" style="margin-top:1rem">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <label style="margin:0">Subtitle tracks</label>
+          <button class="btn" id="studio-add-sub" style="padding:.35rem .8rem;font-size:.78rem;background:#1e293b;border:1px solid #475569">+ Add subtitle</button>
+        </div>
+        <div id="studio-sub-list" style="margin-top:.5rem"></div>
+      </div>
+
+      <!-- Format + Build -->
+      <div class="row" style="gap:1rem;align-items:center;margin-top:1rem">
+        <div class="field" style="flex:0 0 auto">
+          <label>Output format</label>
+          <div class="fmt-bar" id="studio-fmt-bar">
+            <button class="ftab active" data-fmt="mp4">MP4</button>
+            <button class="ftab" data-fmt="mkv">MKV</button>
+          </div>
+        </div>
+        <button class="btn" id="studio-build-btn" style="margin-left:auto" disabled>&#127916; Build video</button>
+      </div>
+
+      <div class="progress" id="studio-prog" style="display:none;margin-top:1rem">
+        <div class="progress-bar-bg"><div class="progress-bar" id="studio-prog-bar"></div></div>
+        <div class="progress-msg" id="studio-prog-msg">Building&hellip;</div>
+      </div>
+      <div class="error-box" id="studio-error-box"></div>
+      <div id="studio-result-area" style="display:none;margin-top:.75rem">
+        <p class="success-msg">&checkmark; Video ready</p>
+        <a id="studio-dl-btn" class="dl-btn" href="#">&#11015; Download video</a>
+      </div>
+    </div>
+  </div><!-- /#tab-pane-studio -->
 </main>
 
 <!-- Log sidebar -->
@@ -2150,6 +2761,205 @@ function showMuxError(msg) {
   showError(msg, muxErrorBox);
   muxGoBtn.disabled = false;
 }
+
+// ===== Top-level tab switching =====
+document.querySelectorAll('.ttab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.ttab').forEach(b => b.classList.toggle('active', b === btn));
+    const target = btn.dataset.pane;
+    document.querySelectorAll('.tab-pane').forEach(p => {
+      const on = p.id === 'tab-pane-' + target;
+      p.hidden = !on;
+      p.classList.toggle('active', on);
+    });
+  });
+});
+
+// ===== Studio tab =====
+const studioState = {
+  video: null,    // {token, name, duration}
+  audios: [],     // [{rowEl, fileInput, langInput, labelInput, token}]
+  subs: [],
+  fmt: "mp4",
+};
+const studioVideoInput = document.getElementById('studio-video-input');
+const studioVideoStatus = document.getElementById('studio-video-status');
+const studioAddAudio = document.getElementById('studio-add-audio');
+const studioAddSub = document.getElementById('studio-add-sub');
+const studioAudioList = document.getElementById('studio-audio-list');
+const studioSubList = document.getElementById('studio-sub-list');
+const studioBuildBtn = document.getElementById('studio-build-btn');
+const studioFmtBar = document.getElementById('studio-fmt-bar');
+const studioProgWrap = document.getElementById('studio-prog');
+const studioProgBar = document.getElementById('studio-prog-bar');
+const studioProgMsg = document.getElementById('studio-prog-msg');
+const studioErrorBox = document.getElementById('studio-error-box');
+const studioResultArea = document.getElementById('studio-result-area');
+const studioDlBtn = document.getElementById('studio-dl-btn');
+
+studioFmtBar.querySelectorAll('.ftab').forEach(b => {
+  b.addEventListener('click', () => {
+    studioFmtBar.querySelectorAll('.ftab').forEach(x => x.classList.toggle('active', x === b));
+    studioState.fmt = b.dataset.fmt;
+  });
+});
+
+function studioRefreshBuildBtn() {
+  studioBuildBtn.disabled = !studioState.video;
+}
+
+async function studioUpload(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch('/studio/upload', {method:'POST', body: fd});
+  if (!r.ok) {
+    let msg = 'Upload failed';
+    try { msg = (await r.json()).error || msg; } catch(e){}
+    throw new Error(msg);
+  }
+  return await r.json();
+}
+
+studioVideoInput.addEventListener('change', async () => {
+  const f = studioVideoInput.files && studioVideoInput.files[0];
+  if (!f) return;
+  studioVideoStatus.textContent = 'Uploading…';
+  try {
+    const info = await studioUpload(f);
+    if (info.kind !== 'video') throw new Error('Selected file is not a video');
+    studioState.video = info;
+    const dur = info.duration ? ' · ' + info.duration.toFixed(1) + 's' : '';
+    studioVideoStatus.textContent = '✓ ' + info.name + dur;
+    studioVideoStatus.style.color = '#86efac';
+  } catch(e) {
+    studioState.video = null;
+    studioVideoStatus.textContent = '✗ ' + e.message;
+    studioVideoStatus.style.color = '#fca5a5';
+  }
+  studioRefreshBuildBtn();
+});
+
+function studioAddTrackRow(kind) {
+  const accept = kind === 'audio'
+    ? '.mp3,.m4a,.aac,.wav,.flac,.ogg,.opus'
+    : '.srt,.vtt,.ass,.ssa';
+  const row = document.createElement('div');
+  row.className = 'studio-track-row';
+  row.innerHTML = `
+    <input type="file" accept="${accept}"/>
+    <input type="text" class="lang-in" placeholder="eng" maxlength="3"/>
+    <input type="text" class="label-in" placeholder="Label (optional)"/>
+    <span class="track-status" style="font-size:.75rem;color:#64748b;min-width:60px"></span>
+    <button class="rm-btn" type="button">✕</button>
+  `;
+  const fileEl = row.querySelector('input[type=file]');
+  const langEl = row.querySelector('.lang-in');
+  const labelEl = row.querySelector('.label-in');
+  const statusEl = row.querySelector('.track-status');
+  const rmBtn = row.querySelector('.rm-btn');
+  const entry = { rowEl: row, fileInput: fileEl, langInput: langEl, labelInput: labelEl, token: null, kind };
+  const list = kind === 'audio' ? studioState.audios : studioState.subs;
+  list.push(entry);
+
+  fileEl.addEventListener('change', async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    statusEl.textContent = 'Uploading…';
+    statusEl.style.color = '#64748b';
+    try {
+      const info = await studioUpload(f);
+      if (info.kind !== kind) throw new Error('Wrong file type');
+      entry.token = info.token;
+      statusEl.textContent = '✓';
+      statusEl.style.color = '#86efac';
+    } catch(e) {
+      entry.token = null;
+      statusEl.textContent = '✗ ' + e.message;
+      statusEl.style.color = '#fca5a5';
+    }
+  });
+  rmBtn.addEventListener('click', () => {
+    const idx = list.indexOf(entry);
+    if (idx >= 0) list.splice(idx, 1);
+    row.remove();
+  });
+  (kind === 'audio' ? studioAudioList : studioSubList).appendChild(row);
+}
+
+studioAddAudio.addEventListener('click', () => studioAddTrackRow('audio'));
+studioAddSub.addEventListener('click', () => studioAddTrackRow('subtitle'));
+
+studioBuildBtn.addEventListener('click', async () => {
+  if (!studioState.video) return;
+  // Validate that every added row has a token
+  const allTracks = [...studioState.audios, ...studioState.subs];
+  const pending = allTracks.find(e => e.fileInput.files[0] && !e.token);
+  if (pending) {
+    showError('Some tracks are still uploading or failed to upload.', studioErrorBox);
+    return;
+  }
+  studioErrorBox.style.display = 'none';
+  studioResultArea.style.display = 'none';
+  studioProgWrap.style.display = 'block';
+  studioProgBar.style.width = '0%';
+  studioProgMsg.textContent = 'Starting…';
+  studioBuildBtn.disabled = true;
+
+  const payload = {
+    video_token: studioState.video.token,
+    audio_tracks: studioState.audios.filter(e => e.token).map(e => ({
+      token: e.token, lang: e.langInput.value.trim(), label: e.labelInput.value.trim(),
+    })),
+    subtitle_tracks: studioState.subs.filter(e => e.token).map(e => ({
+      token: e.token, lang: e.langInput.value.trim(), label: e.labelInput.value.trim(),
+    })),
+    output_format: studioState.fmt,
+  };
+
+  let muxId;
+  try {
+    const r = await fetch('/studio/build', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const msg = (await r.json().catch(()=>({}))).error || 'Build failed';
+      throw new Error(msg);
+    }
+    muxId = (await r.json()).mux_id;
+  } catch(e) {
+    studioProgWrap.style.display = 'none';
+    showError(e.message, studioErrorBox);
+    studioBuildBtn.disabled = false;
+    return;
+  }
+
+  const es = new EventSource('/stream_mux/' + muxId);
+  es.addEventListener('progress', ev => {
+    try {
+      const d = JSON.parse(ev.data);
+      studioProgBar.style.width = (d.pct || 50) + '%';
+      studioProgMsg.textContent = d.msg || 'Building…';
+    } catch(e){}
+  });
+  es.addEventListener('done', ev => {
+    es.close();
+    studioProgBar.style.width = '100%';
+    studioProgMsg.textContent = 'Done';
+    studioDlBtn.href = '/download_muxed/' + muxId;
+    studioResultArea.style.display = 'block';
+    studioBuildBtn.disabled = false;
+  });
+  es.addEventListener('error', ev => {
+    es.close();
+    let msg = 'Build failed';
+    try { msg = JSON.parse(ev.data).msg || msg; } catch(e){}
+    studioProgWrap.style.display = 'none';
+    showError(msg, studioErrorBox);
+    studioBuildBtn.disabled = false;
+  });
+});
 </script>
 </body>
 </html>
