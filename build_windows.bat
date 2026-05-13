@@ -93,19 +93,21 @@ echo       Found Python !PY_VER! at !PYTHON_EXE!
 :: ============================================================
 :: 5. Install / verify ffmpeg
 :: ============================================================
-echo [4/7] Checking ffmpeg...
+echo [4/7] Checking ffmpeg + ffprobe...
 if exist "%PROJECT_DIR%\ffmpeg.exe" (
     echo       Found bundled ffmpeg.exe — skipping download.
     set FFMPEG_READY=1
 ) else if exist "ffmpeg.exe" (
     echo       Found ffmpeg.exe in current folder.
     copy "ffmpeg.exe" "%PROJECT_DIR%\ffmpeg.exe" >nul 2>&1
+    if exist "ffprobe.exe" copy "ffprobe.exe" "%PROJECT_DIR%\ffprobe.exe" >nul 2>&1
     set FFMPEG_READY=1
 ) else (
     where ffmpeg >nul 2>&1
     if not errorlevel 1 (
         echo       Found ffmpeg on PATH — copying to project folder for bundling...
         for /f "tokens=*" %%i in ('where ffmpeg') do copy "%%i" "%PROJECT_DIR%\ffmpeg.exe" >nul
+        for /f "tokens=*" %%i in ('where ffprobe 2^>nul') do copy "%%i" "%PROJECT_DIR%\ffprobe.exe" >nul
         set FFMPEG_READY=1
     ) else (
         echo       ffmpeg not found — installing via winget...
@@ -119,6 +121,9 @@ if exist "%PROJECT_DIR%\ffmpeg.exe" (
                 copy "%%i" "%PROJECT_DIR%\ffmpeg.exe" >nul
                 set FFMPEG_READY=1
             )
+            for /f "tokens=*" %%i in ('where ffprobe 2^>nul') do (
+                copy "%%i" "%PROJECT_DIR%\ffprobe.exe" >nul
+            )
         )
     )
 )
@@ -126,7 +131,7 @@ if exist "%PROJECT_DIR%\ffmpeg.exe" (
 if not defined FFMPEG_READY (
     echo [ERROR] Could not locate or install ffmpeg.
     echo         Download manually from https://ffmpeg.org/download.html
-    echo         Place ffmpeg.exe in: %PROJECT_DIR%
+    echo         Place ffmpeg.exe and ffprobe.exe in: %PROJECT_DIR%
     pause & exit /b 1
 )
 cd /d "%PROJECT_DIR%"
@@ -236,10 +241,13 @@ echo       Extracting ffmpeg.exe...
 powershell -NoProfile -Command ^
   "Expand-Archive -Path '%FFMPEG_ZIP%' -DestinationPath 'ffmpeg_tmp' -Force"
 
-:: The zip has a versioned subdirectory — find ffmpeg.exe recursively
+:: The zip has a versioned subdirectory — find ffmpeg.exe and ffprobe.exe recursively
 for /r "ffmpeg_tmp" %%f in (ffmpeg.exe) do (
     copy "%%f" "%PROJECT_DIR%\ffmpeg.exe" >nul
     set FFMPEG_READY=1
+)
+for /r "ffmpeg_tmp" %%f in (ffprobe.exe) do (
+    copy "%%f" "%PROJECT_DIR%\ffprobe.exe" >nul
 )
 
 rmdir /s /q "ffmpeg_tmp" 2>nul
